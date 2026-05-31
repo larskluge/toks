@@ -1,0 +1,782 @@
+#!/usr/bin/env python3
+"""toks - list local models (Ollama + LM Studio) with a cached tokens/sec column.
+
+Single-file, standard-library only. See
+docs/superpowers/specs/2026-05-31-toks-lmstudio-provider-design.md
+"""
+import argparse
+import concurrent.futures
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+DEFAULT_LMSTUDIO_URL = "http://localhost:1234"
+DEFAULT_PROMPT = "Write one concise paragraph about local language models."
+DEFAULT_MAX_TOKENS = 128
+
+AVAIL_TIMEOUT = 5      # reachability probe
+LIST_TIMEOUT = 10      # listing (remote LM Studio may be slower than local)
+INFO_TIMEOUT = 5       # per-model /api/show
+BENCH_TIMEOUT = 600    # generation (JIT load of large models is slow)
+
+
+def normalize_host(value, default):
+    host = (value or default).strip().rstrip("/")
+    if not host.startswith(("http://", "https://")):
+        host = "http://" + host
+    return host
+
+
+# --- normalized model record ------------------------------------------------
+
+
+@dataclass
+class ModelRecord:
+    provider: str                       # "ollama" | "lmstudio"
+    name: str                           # display id (Ollama tag / LM Studio id)
+    fmt: str = ""                       # gguf | safetensors | mlx | ""
+    params: str = "-"                   # display string, e.g. "8B" or "-"
+    moe: bool = False
+    quant: str = "-"
+    size_bytes: float | None = None     # on-disk size, None if unknown
+    modified_at: str | None = None      # ISO timestamp, None for LM Studio
+    ctx_max: int | None = None
+    ctx_loaded: int | None = None
+    benchmarkable: bool = False
+    digest: str | None = None           # stable id for cache key (Ollama digest)
+    raw: dict = field(default_factory=dict)
+
+
+@dataclass
+class BenchResult:
+    tokens_per_second: float
+    time_to_first_token: float | None = None
+
+
+def _looks_moe(*texts):
+    return any("moe" in (t or "").lower() for t in texts)
+
+
+# --- LM Studio provider parsing ---------------------------------------------
+
+
+def lmstudio_parse_models(payload):
+    """Parse a GET /api/v0/models response into ModelRecords."""
+    data = (payload or {}).get("data")
+    if not isinstance(data, list):
+        return []
+    records = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id")
+        if not model_id:
+            continue
+        model_type = (item.get("type") or "").lower()
+        fmt = (item.get("compatibility_type") or "").lower()
+        records.append(
+            ModelRecord(
+                provider="lmstudio",
+                name=model_id,
+                fmt=fmt,
+                quant=item.get("quantization") or "-",
+                moe=_looks_moe(item.get("arch")),
+                ctx_max=item.get("max_context_length"),
+                ctx_loaded=item.get("loaded_context_length"),
+                benchmarkable=model_type in ("llm", "vlm"),
+                raw=item,
+            )
+        )
+    return records
+
+
+def lmstudio_enrich(records, v1_payload):
+    """Best-effort backfill of size_bytes/params from GET /api/v1/models.
+
+    The richer v1 listing (LM Studio 0.4.0+) may expose on-disk size and a
+    parameter string that the v0 listing omits. Absent or malformed payloads
+    leave records untouched -- never raises.
+    """
+    if not isinstance(v1_payload, dict):
+        return
+    # The native v1 listing nests under "models" and keys each entry by "key";
+    # tolerate the OpenAI-style "data"/"id" shape too in case a version differs.
+    items = v1_payload.get("models")
+    if not isinstance(items, list):
+        items = v1_payload.get("data")
+    if not isinstance(items, list):
+        return
+    by_id = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        ident = item.get("key") or item.get("id")
+        if ident:
+            by_id[ident] = item
+    for rec in records:
+        extra = by_id.get(rec.name)
+        if not extra:
+            continue
+        size = extra.get("size_bytes")
+        if isinstance(size, (int, float)) and size > 0:
+            rec.size_bytes = size
+        params = extra.get("params_string")
+        if params:
+            rec.params = params
+
+
+def parse_lmstudio_bench(response):
+    """Read server-measured throughput from an LM Studio completion response."""
+    stats = (response or {}).get("stats")
+    if not isinstance(stats, dict):
+        return None
+    tps = stats.get("tokens_per_second")
+    if not isinstance(tps, (int, float)) or tps <= 0:
+        return None
+    ttft = stats.get("time_to_first_token")
+    if not isinstance(ttft, (int, float)):
+        ttft = None
+    return BenchResult(float(tps), ttft)
+
+
+def parse_ollama_bench(response):
+    """Compute throughput (and TTFT) from an Ollama /api/generate response."""
+    response = response or {}
+    eval_count = response.get("eval_count")
+    eval_duration = response.get("eval_duration")
+    if not isinstance(eval_count, (int, float)) or not isinstance(eval_duration, (int, float)):
+        return None
+    if eval_count <= 0 or eval_duration <= 0:
+        return None
+    tps = float(eval_count) / (float(eval_duration) / 1_000_000_000.0)
+    # Time to first token = model load + prompt evaluation, in seconds.
+    ttft = None
+    load = response.get("load_duration") or 0
+    prompt_eval = response.get("prompt_eval_duration")
+    if isinstance(prompt_eval, (int, float)) and prompt_eval > 0:
+        ttft = (float(load) + float(prompt_eval)) / 1_000_000_000.0
+    return BenchResult(tps, ttft)
+
+
+# --- formatting helpers (ported from the original ollama-list-with-tps) ------
+
+
+def parse_modified(value):
+    if not value:
+        return None
+    cleaned = value.replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(cleaned)
+    except ValueError:
+        return None
+
+
+def human_age(value):
+    dt = parse_modified(value)
+    if dt is None:
+        return value or "-"
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    now = datetime.now(timezone.utc)
+    seconds = max(0, int((now - dt.astimezone(timezone.utc)).total_seconds()))
+    units = [
+        ("year", 365 * 24 * 60 * 60),
+        ("month", 30 * 24 * 60 * 60),
+        ("week", 7 * 24 * 60 * 60),
+        ("day", 24 * 60 * 60),
+        ("hour", 60 * 60),
+        ("minute", 60),
+    ]
+    for name, unit_seconds in units:
+        count = seconds // unit_seconds
+        if count:
+            suffix = "" if count == 1 else "s"
+            return f"{count} {name}{suffix} ago"
+    return "just now"
+
+
+def human_size(size):
+    try:
+        value = float(size)
+    except (TypeError, ValueError):
+        return "-"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return "-"
+
+
+def quant_bits_per_weight(quant):
+    # Approximate stored bits per weight (payload + quant scales) for the
+    # quantization levels Ollama reports. Used to sanity-check and, when
+    # needed, estimate parameter counts from on-disk size.
+    q = (quant or "").lower()
+    if any(t in q for t in ("fp4", "mxfp4", "nvfp4", "nf4", "int4", "q4")):
+        return 4.5
+    if "q5" in q:
+        return 5.5
+    if "q6" in q:
+        return 6.5
+    if any(t in q for t in ("fp8", "int8", "q8")):
+        return 8.5
+    if any(t in q for t in ("bf16", "fp16", "f16")):
+        return 16.0
+    if any(t in q for t in ("fp32", "f32")):
+        return 32.0
+    return 8.0
+
+
+def human_params(total, expert_count, expert_used):
+    if not total:
+        return "-"
+    total_b = total / 1e9
+    if expert_count and expert_used and expert_count > 1:
+        return f"{total_b:.0f}B MoE {expert_used}/{expert_count}"
+    return f"{total_b:.0f}B"
+
+
+# --- Ollama provider parsing ------------------------------------------------
+
+
+def model_format(model):
+    details = model.get("details")
+    if not isinstance(details, dict):
+        return ""
+    value = details.get("format")
+    return value.lower() if isinstance(value, str) else ""
+
+
+def is_moe(model, info):
+    # gguf models expose an .expert_count in model_info; safetensors/MLX models
+    # have a sparse model_info, so fall back to the family/architecture name.
+    for key, value in info.items():
+        if key.endswith(".expert_count"):
+            try:
+                if int(value) > 1:
+                    return True
+            except (TypeError, ValueError):
+                pass
+    arch = (info.get("general.architecture") or "").lower()
+    details = model.get("details") or {}
+    family = (details.get("family") or "").lower()
+    families = " ".join(details.get("families") or []).lower()
+    return _looks_moe(arch, family, families)
+
+
+def ollama_params(model, info):
+    total = None
+    expert_count = None
+    expert_used = None
+    for key, value in info.items():
+        if key == "general.parameter_count":
+            total = value
+        elif key.endswith(".expert_count"):
+            expert_count = value
+        elif key.endswith(".expert_used_count"):
+            expert_used = value
+
+    size = model.get("size")
+    quant = (model.get("details") or {}).get("quantization_level")
+    bpw = quant_bits_per_weight(quant)
+    estimated = False
+
+    # Some MLX/safetensors models ship a bogus general.parameter_count (e.g. a
+    # 26B model that reports 6B). A real quant can't pack more bits per weight
+    # than fp16, so an implied width far above the quant's nominal one means the
+    # reported count is wrong -- discard it and estimate from the file size.
+    if total and size and bpw:
+        implied = (float(size) * 8.0) / float(total)
+        if implied > bpw * 2.5:
+            total = None
+    if not total and size and bpw:
+        total = int(float(size) * 8.0 / bpw)
+        estimated = True
+
+    text = human_params(total, expert_count, expert_used)
+    if estimated and text != "-":
+        text = "~" + text
+    return text
+
+
+def ollama_context_length(info):
+    arch = info.get("general.architecture")
+    if arch:
+        value = info.get(f"{arch}.context_length")
+        if isinstance(value, int):
+            return value
+    for key, value in info.items():
+        if key.endswith(".context_length") and isinstance(value, int):
+            return value
+    return None
+
+
+def ollama_parse_models(tags_models, info_map):
+    """Build ModelRecords from /api/tags items + per-name /api/show model_info."""
+    records = []
+    for model in tags_models or []:
+        name = model.get("name")
+        if not name:
+            continue
+        info = (info_map or {}).get(name, {}) or {}
+        fmt = model_format(model)
+        details = model.get("details") or {}
+        records.append(
+            ModelRecord(
+                provider="ollama",
+                name=name,
+                fmt=fmt,
+                params=ollama_params(model, info),
+                moe=is_moe(model, info),
+                quant=details.get("quantization_level") or "-",
+                size_bytes=model.get("size"),
+                modified_at=model.get("modified_at"),
+                ctx_max=ollama_context_length(info),
+                benchmarkable=fmt in ("gguf", "safetensors"),
+                digest=model.get("digest"),
+                raw=model,
+            )
+        )
+    return records
+
+
+# --- shared rendering -------------------------------------------------------
+
+
+def tag_cell(rec):
+    """Render the TAG badge from a record's format + MoE flag."""
+    if rec.fmt == "safetensors":
+        tag = "mlx"
+    elif rec.fmt in ("gguf", "mlx"):
+        tag = rec.fmt
+    else:
+        tag = ""
+    if rec.moe:
+        tag = (tag + " moe").strip()
+    return tag or "-"
+
+
+# --- benchmark cache --------------------------------------------------------
+
+_PROVIDER_PREFIXES = ("ollama:", "lmstudio:")
+
+
+def cache_key(rec):
+    """Stable per-record cache key: provider:digest-or-name.
+
+    The digest (Ollama) or model id (LM Studio) already identifies the exact
+    model variant, so quantization is not part of the key -- this also lets
+    legacy digest-keyed entries migrate cleanly (they store no quant).
+    """
+    inner = rec.digest or rec.name
+    return f"{rec.provider}:{inner}"
+
+
+def migrate_cache(cache):
+    """Re-key legacy (pre-multi-provider) entries under the ollama: namespace.
+
+    Legacy keys are bare digests or model names with no provider prefix. Any
+    key already starting with a known provider prefix is left untouched, so the
+    migration is idempotent.
+    """
+    if not isinstance(cache, dict):
+        return {}
+    migrated = {}
+    for key, entry in cache.items():
+        if isinstance(key, str) and key.startswith(_PROVIDER_PREFIXES):
+            migrated[key] = entry
+            continue
+        if isinstance(entry, dict):
+            entry = dict(entry)
+            entry.setdefault("provider", "ollama")
+        migrated[f"ollama:{key}"] = entry
+    return migrated
+
+
+def _cache_entry(cache, rec):
+    entry = cache.get(cache_key(rec))
+    return entry if isinstance(entry, dict) else None
+
+
+def cached_tps(cache, rec):
+    entry = _cache_entry(cache, rec)
+    if not entry:
+        return None
+    value = entry.get("tokens_per_second")
+    if isinstance(value, (int, float)) and value > 0:
+        return float(value)
+    return None
+
+
+def cached_ttft(cache, rec):
+    entry = _cache_entry(cache, rec)
+    if not entry:
+        return None
+    value = entry.get("time_to_first_token")
+    if isinstance(value, (int, float)) and value > 0:
+        return float(value)
+    return None
+
+
+def tps_sort_key(cache, rec):
+    tps = cached_tps(cache, rec)
+    if tps is None:
+        return (1, 0.0, rec.name or "")
+    return (0, -tps, rec.name or "")
+
+
+# --- table rendering --------------------------------------------------------
+
+HEADER = ["PROVIDER", "NAME", "SIZE", "TAG", "PARAMS", "CTX", "TTFT",
+          "TOKENS/S", "MODIFIED"]
+RIGHT_ALIGN = {"SIZE", "PARAMS", "CTX", "TTFT", "TOKENS/S"}
+
+
+def build_rows(records, cache):
+    rows = [list(HEADER)]
+    for rec in records:
+        tps = cached_tps(cache, rec)
+        ttft = cached_ttft(cache, rec)
+        ctx = rec.ctx_loaded or rec.ctx_max
+        rows.append([
+            rec.provider,
+            rec.name or "-",
+            human_size(rec.size_bytes),
+            tag_cell(rec),
+            rec.params or "-",
+            str(ctx) if ctx else "-",
+            f"{ttft:.2f}" if ttft else "-",
+            f"{tps:.1f}" if tps else "-",
+            human_age(rec.modified_at) if rec.modified_at else "-",
+        ])
+    return rows
+
+
+def table(rows):
+    col_count = len(rows[0]) if rows else 0
+    widths = [0] * col_count
+    for row in rows:
+        for index, cell in enumerate(row):
+            widths[index] = max(widths[index], len(cell))
+    header = rows[0] if rows else []
+    lines = []
+    for row in rows:
+        cells = []
+        for index, cell in enumerate(row):
+            if header[index] in RIGHT_ALIGN:
+                cells.append(cell.rjust(widths[index]))
+            else:
+                cells.append(cell.ljust(widths[index]))
+        lines.append("  ".join(cells))
+    return "\n".join(lines)
+
+
+# --- HTTP + hosts (I/O) -----------------------------------------------------
+
+# Talk straight to the backend with no proxy. Ollama/LM Studio live on localhost
+# or a private LAN address, which should never route through an HTTP proxy; an empty
+# ProxyHandler also skips macOS's _scproxy system-proxy lookup (which fork()s from
+# threads) during our parallel /api/show fetch.
+_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def ollama_url():
+    return normalize_host(os.environ.get("OLLAMA_URL"), DEFAULT_OLLAMA_URL)
+
+
+def lmstudio_url():
+    return normalize_host(os.environ.get("LMSTUDIO_URL"), DEFAULT_LMSTUDIO_URL)
+
+
+def lmstudio_headers():
+    token = os.environ.get("LMSTUDIO_API_KEY") or os.environ.get("LM_API_TOKEN")
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def http_json(url, payload=None, headers=None, timeout=120):
+    data = None
+    hdrs = dict(headers or {})
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        hdrs["Content-Type"] = "application/json"
+    request = urllib.request.Request(url, data=data, headers=hdrs)
+    try:
+        with _OPENER.open(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401:
+            raise RuntimeError(
+                f"{url} returned 401 (set LMSTUDIO_API_KEY / LM_API_TOKEN?)"
+            ) from exc
+        raise RuntimeError(f"{url} returned HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"could not reach {url}: {exc.reason}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid JSON from {url}") from exc
+
+
+# --- providers (I/O) --------------------------------------------------------
+
+
+def fetch_model_info(host, model_name):
+    try:
+        data = http_json(f"{host}/api/show", payload={"name": model_name}, timeout=INFO_TIMEOUT)
+    except RuntimeError:
+        return {}
+    return data.get("model_info") or {}
+
+
+def fetch_all_model_info(host, models):
+    result = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {
+            pool.submit(fetch_model_info, host, m.get("name")): m.get("name")
+            for m in models if m.get("name")
+        }
+        for future in concurrent.futures.as_completed(futures):
+            name = futures[future]
+            try:
+                result[name] = future.result()
+            except Exception:
+                result[name] = {}
+    return result
+
+
+class OllamaProvider:
+    name = "ollama"
+
+    def __init__(self):
+        self.host = ollama_url()
+
+    def list_models(self):
+        data = http_json(f"{self.host}/api/tags", timeout=LIST_TIMEOUT)
+        models = data.get("models", [])
+        if not isinstance(models, list):
+            raise RuntimeError("Ollama returned an unexpected /api/tags response")
+        info = fetch_all_model_info(self.host, models)
+        return ollama_parse_models(models, info)
+
+    def benchmark(self, rec, prompt, max_tokens):
+        payload = {
+            "model": rec.name,
+            "prompt": prompt,
+            "stream": False,
+            "options": {"num_predict": max_tokens},
+        }
+        resp = http_json(f"{self.host}/api/generate", payload=payload, timeout=BENCH_TIMEOUT)
+        return parse_ollama_bench(resp)
+
+
+class LMStudioProvider:
+    name = "lmstudio"
+
+    def __init__(self):
+        self.host = lmstudio_url()
+        self.headers = lmstudio_headers()
+
+    def list_models(self):
+        data = http_json(f"{self.host}/api/v0/models", headers=self.headers, timeout=LIST_TIMEOUT)
+        records = lmstudio_parse_models(data)
+        # Best-effort: richer v1 listing may carry size/params the v0 one omits.
+        try:
+            v1 = http_json(f"{self.host}/api/v1/models", headers=self.headers, timeout=LIST_TIMEOUT)
+            lmstudio_enrich(records, v1)
+        except RuntimeError:
+            pass
+        return records
+
+    def _completion(self, rec, prompt, max_tokens):
+        payload = {
+            "model": rec.name,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "stream": False,
+            "temperature": 0,
+        }
+        return http_json(
+            f"{self.host}/api/v0/completions",
+            payload=payload,
+            headers=self.headers,
+            timeout=BENCH_TIMEOUT,
+        )
+
+    def benchmark(self, rec, prompt, max_tokens):
+        # LM Studio JIT-loads on first request; a 1-token warmup absorbs the load
+        # time so it doesn't pollute the measured run's stats.
+        try:
+            self._completion(rec, prompt, 1)
+        except RuntimeError:
+            pass
+        return parse_lmstudio_bench(self._completion(rec, prompt, max_tokens))
+
+
+def select_providers(choice):
+    if choice == "ollama":
+        return [OllamaProvider()]
+    if choice == "lmstudio":
+        return [LMStudioProvider()]
+    return [OllamaProvider(), LMStudioProvider()]
+
+
+def gather_records(providers):
+    """List models from every reachable provider; isolate per-provider failures."""
+    records = []
+    active = {}
+    for provider in providers:
+        try:
+            recs = provider.list_models()
+        except RuntimeError as exc:
+            print(f"note: skipping {provider.name}: {exc}", file=sys.stderr)
+            continue
+        records.extend(recs)
+        active[provider.name] = provider
+    return records, active
+
+
+# --- cache persistence (I/O) ------------------------------------------------
+
+
+def _cache_root():
+    base = os.environ.get("XDG_CACHE_HOME")
+    return Path(base) if base else Path.home() / ".cache"
+
+
+def cache_path():
+    return _cache_root() / "toks" / "tokens-per-second.json"
+
+
+def legacy_cache_path():
+    return _cache_root() / "ollama-list-with-tps" / "tokens-per-second.json"
+
+
+def load_cache():
+    path = cache_path()
+    source = path if path.exists() else legacy_cache_path()
+    if not source.exists():
+        return {}
+    try:
+        with source.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return migrate_cache(data)
+
+
+def save_cache(cache):
+    path = cache_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(cache, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+# --- orchestration ----------------------------------------------------------
+
+
+def run_benchmarks(records, active, args, cache):
+    """Benchmark the selected records in place; return True if the cache changed."""
+    changed = False
+    for rec in records:
+        if args.missing and cached_tps(cache, rec):
+            continue
+        if not rec.benchmarkable:
+            print(f"skipping {rec.name}: unsupported model type/format", file=sys.stderr)
+            continue
+        provider = active.get(rec.provider)
+        if provider is None:
+            continue
+        print(f"benchmarking {rec.provider}/{rec.name}...", file=sys.stderr)
+        try:
+            result = provider.benchmark(rec, args.prompt, args.max_tokens)
+        except RuntimeError as exc:
+            print(f"warning: benchmark failed for {rec.name}: {exc}", file=sys.stderr)
+            continue
+        if result is None:
+            print(f"warning: no throughput stats returned for {rec.name}", file=sys.stderr)
+            continue
+        cache[cache_key(rec)] = {
+            "provider": rec.provider,
+            "model": rec.name,
+            "tokens_per_second": result.tokens_per_second,
+            "time_to_first_token": result.time_to_first_token,
+            "benchmarked_at": int(time.time()),
+            "prompt": args.prompt,
+            "max_tokens": args.max_tokens,
+        }
+        changed = True
+    return changed
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="List local models (Ollama + LM Studio) with a cached tokens/sec column."
+    )
+    parser.add_argument(
+        "--provider",
+        choices=("ollama", "lmstudio", "all"),
+        default="all",
+        help="which backend(s) to query (default: all reachable)",
+    )
+    parser.add_argument("--bench", action="store_true",
+                        help="benchmark selected models before printing the table")
+    parser.add_argument("--all", action="store_true",
+                        help="with --bench, benchmark all listed models")
+    parser.add_argument("--missing", action="store_true",
+                        help="with --bench, benchmark only models without a cached value")
+    parser.add_argument("--model", action="append",
+                        help="only show or benchmark this model; may be repeated")
+    parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="prompt used for --bench")
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS,
+                        help="maximum generated tokens for --bench")
+    args = parser.parse_args()
+
+    if args.max_tokens <= 0:
+        parser.error("--max-tokens must be greater than zero")
+    if args.bench and args.missing and not args.model:
+        args.all = True
+    if args.all and args.model:
+        parser.error("--all cannot be combined with --model")
+    if args.missing and not args.bench:
+        parser.error("--missing requires --bench")
+    if args.bench and not args.model and not args.all:
+        parser.error("--bench requires --model MODEL or --all")
+
+    records, active = gather_records(select_providers(args.provider))
+    if not active:
+        raise RuntimeError("no model providers reachable")
+
+    requested = set(args.model or [])
+    if requested:
+        records = [r for r in records if r.name in requested]
+        missing = sorted(requested - {r.name for r in records})
+        if missing:
+            print(f"warning: model not found: {', '.join(missing)}", file=sys.stderr)
+
+    cache = load_cache()
+    if args.bench and run_benchmarks(records, active, args, cache):
+        save_cache(cache)
+
+    records.sort(key=lambda r: tps_sort_key(cache, r))
+    print(table(build_rows(records, cache)))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except RuntimeError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(1)
+
