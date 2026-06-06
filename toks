@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""toks - list local models (Ollama + LM Studio) with a cached tokens/sec column.
+"""toks - list local models (Ollama + LM Studio + mlx-lm) with a cached tokens/sec column.
 
 Single-file, standard-library only. See
 docs/superpowers/specs/2026-05-31-toks-lmstudio-provider-design.md
+docs/superpowers/specs/2026-06-06-mlx-provider-design.md
 """
 import argparse
 import concurrent.futures
@@ -11,6 +12,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -19,6 +21,7 @@ from pathlib import Path
 
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_LMSTUDIO_URL = "http://localhost:1234"
+DEFAULT_MLX_URL = "http://localhost:8080"
 DEFAULT_PROMPT = "Write one concise paragraph about local language models."
 DEFAULT_MAX_TOKENS = 128
 
@@ -40,7 +43,7 @@ def normalize_host(value, default):
 
 @dataclass
 class ModelRecord:
-    provider: str                       # "ollama" | "lmstudio"
+    provider: str                       # "ollama" | "lmstudio" | "mlx"
     name: str                           # display id (Ollama tag / LM Studio id)
     fmt: str = ""                       # gguf | safetensors | mlx | ""
     params: str = "-"                   # display string, e.g. "8B" or "-"
@@ -351,6 +354,164 @@ def ollama_parse_models(tags_models, info_map):
     return records
 
 
+# --- mlx provider parsing (mlx_lm.server) ------------------------------------
+
+
+def mlx_parse_models(payload):
+    """Parse a GET /v1/models response from mlx_lm.server into ModelRecords.
+
+    The listing carries only model ids; everything else comes from the local
+    HF-cache enrichment (when running on the server's machine) or stays "-".
+    """
+    data = (payload or {}).get("data")
+    if not isinstance(data, list):
+        return []
+    records = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id")
+        if not model_id:
+            continue
+        records.append(
+            ModelRecord(
+                provider="mlx",
+                name=model_id,
+                fmt="mlx",
+                # Optimistic default: remote hosts can't check configs, and a
+                # failed bench only warns. Local enrichment demotes non-LLMs.
+                benchmarkable=True,
+                raw=item,
+            )
+        )
+    return records
+
+
+def _mlx_snapshot(hub_root, model_id):
+    """Locate a model's on-disk snapshot: HF-cache repo, or a path id directly.
+
+    Returns (snapshot_dir, refs_main_path); the ref is None for path ids.
+    mlx_lm.server appends its --model CLI arg as an absolute-path id when it
+    points at a local directory.
+    """
+    path = Path(model_id)
+    if path.is_absolute():
+        return (path, None) if path.is_dir() else (None, None)
+    repo = Path(hub_root) / ("models--" + model_id.replace("/", "--"))
+    ref = repo / "refs" / "main"
+    try:
+        commit = ref.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None, None
+    snapshot = repo / "snapshots" / commit
+    return (snapshot, ref) if snapshot.is_dir() else (None, None)
+
+
+def mlx_enrich(records, hub_root):
+    """Best-effort backfill of size/quant/ctx/MoE/params from the local HF cache.
+
+    Only meaningful when toks runs on the same machine as mlx_lm.server (the
+    default localhost setup). Absent repos or malformed configs leave records
+    untouched -- never raises. A repo without a top-level config.json is not an
+    mlx-lm text model (the server's loose cache scan also matches e.g.
+    diffusers image repos), so those are demoted to non-benchmarkable.
+    """
+    for rec in records:
+        snapshot, ref = _mlx_snapshot(hub_root, rec.name)
+        if snapshot is None:
+            continue
+        try:
+            size = sum(f.stat().st_size for f in snapshot.rglob("*") if f.is_file())
+        except OSError:
+            size = None
+        if size:
+            rec.size_bytes = size
+        if ref is not None:
+            try:
+                mtime = ref.stat().st_mtime
+                rec.modified_at = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+            except OSError:
+                pass
+        try:
+            with (snapshot / "config.json").open("r", encoding="utf-8") as handle:
+                config = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            config = None
+        if not isinstance(config, dict) or not config.get("model_type"):
+            rec.benchmarkable = False
+            continue
+        ctx = config.get("max_position_embeddings")
+        if isinstance(ctx, int) and ctx > 0:
+            rec.ctx_max = ctx
+        quant = config.get("quantization")
+        bits = quant.get("bits") if isinstance(quant, dict) else None
+        if isinstance(bits, (int, float)) and bits > 0:
+            rec.quant = f"{bits:g}bit"
+            bpw = float(bits) + 0.5    # payload + quant scales, as elsewhere
+        else:
+            bpw = 16.0                 # unquantized MLX models ship bf16
+        rec.moe = any(
+            isinstance(value, int) and value > 1 and "expert" in key
+            for key, value in config.items()
+        )
+        if rec.size_bytes:
+            total = int(float(rec.size_bytes) * 8.0 / bpw)
+            text = human_params(
+                total, config.get("num_experts"), config.get("num_experts_per_tok"))
+            if text != "-":
+                text = "~" + text      # estimated from size, like Ollama's path
+            rec.params = text
+
+
+def bench_from_sse(lines, start, clock=time.monotonic):
+    """Time an OpenAI-style SSE completion stream client-side.
+
+    mlx_lm.server reports no speed stats, so we measure: TTFT is the first
+    content chunk minus `start` (request send), throughput is the tokens after
+    the first over the first->last chunk interval -- cleanly excluding prompt
+    eval. The token count comes from the final usage chunk (requested via
+    stream_options include_usage), falling back to counting content chunks.
+    Returns None when nothing measurable arrived.
+    """
+    first = last = None
+    chunk_count = 0
+    completion_tokens = None
+    for raw in lines:
+        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        usage = event.get("usage")
+        if isinstance(usage, dict):
+            tokens = usage.get("completion_tokens")
+            if isinstance(tokens, int) and tokens > 0:
+                completion_tokens = tokens
+        choices = event.get("choices") or []
+        content = ""
+        if choices and isinstance(choices[0], dict):
+            content = (choices[0].get("text")
+                       or (choices[0].get("delta") or {}).get("content") or "")
+        if content:
+            now = clock()
+            if first is None:
+                first = now
+            last = now
+            chunk_count += 1
+    if first is None or last <= first:
+        return None
+    tokens = completion_tokens or chunk_count
+    if tokens < 2:
+        return None
+    return BenchResult((tokens - 1) / (last - first), first - start)
+
+
 # --- shared rendering -------------------------------------------------------
 
 
@@ -369,7 +530,7 @@ def tag_cell(rec):
 
 # --- benchmark cache --------------------------------------------------------
 
-_PROVIDER_PREFIXES = ("ollama:", "lmstudio:")
+_PROVIDER_PREFIXES = ("ollama:", "lmstudio:", "mlx:")
 
 
 def cache_key(rec):
@@ -504,6 +665,26 @@ def lmstudio_headers():
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
+def mlx_url():
+    return normalize_host(os.environ.get("MLX_URL"), DEFAULT_MLX_URL)
+
+
+def is_local_host(url):
+    """True when the URL points at this machine (HF-cache enrichment works)."""
+    return urllib.parse.urlsplit(url).hostname in ("localhost", "127.0.0.1", "::1")
+
+
+def hf_hub_root():
+    """The Hugging Face hub cache dir, honoring HF_HUB_CACHE / HF_HOME."""
+    cache = os.environ.get("HF_HUB_CACHE")
+    if cache:
+        return Path(cache)
+    home = os.environ.get("HF_HOME")
+    if home:
+        return Path(home) / "hub"
+    return Path.home() / ".cache" / "huggingface" / "hub"
+
+
 def http_json(url, payload=None, headers=None, timeout=120):
     data = None
     hdrs = dict(headers or {})
@@ -524,6 +705,20 @@ def http_json(url, payload=None, headers=None, timeout=120):
         raise RuntimeError(f"could not reach {url}: {exc.reason}") from exc
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"invalid JSON from {url}") from exc
+
+
+def http_sse(url, payload, timeout):
+    """POST a JSON payload and yield the raw SSE response lines."""
+    data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"})
+    try:
+        with _OPENER.open(request, timeout=timeout) as response:
+            yield from response
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"{url} returned HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"could not reach {url}: {exc.reason}") from exc
 
 
 # --- providers (I/O) --------------------------------------------------------
@@ -621,12 +816,53 @@ class LMStudioProvider:
         return parse_lmstudio_bench(self._completion(rec, prompt, max_tokens))
 
 
+class MlxProvider:
+    name = "mlx"
+
+    def __init__(self):
+        self.host = mlx_url()
+
+    def list_models(self):
+        data = http_json(f"{self.host}/v1/models", timeout=LIST_TIMEOUT)
+        records = mlx_parse_models(data)
+        # Listing is ids-only; metadata lives in the HF cache, readable only
+        # when the server runs on this machine (the default localhost setup).
+        if records and is_local_host(self.host):
+            mlx_enrich(records, hf_hub_root())
+        return records
+
+    def benchmark(self, rec, prompt, max_tokens):
+        # Models JIT-load on first request; a 1-token warmup absorbs the load
+        # so it doesn't pollute the timed run (same trick as LM Studio).
+        warmup = {"model": rec.name, "prompt": prompt, "max_tokens": 1,
+                  "stream": False, "temperature": 0}
+        try:
+            http_json(f"{self.host}/v1/completions", payload=warmup,
+                      timeout=BENCH_TIMEOUT)
+        except RuntimeError:
+            pass
+        payload = {
+            "model": rec.name,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "temperature": 0,
+        }
+        start = time.monotonic()
+        lines = http_sse(f"{self.host}/v1/completions", payload, BENCH_TIMEOUT)
+        return bench_from_sse(lines, start)
+
+
 def select_providers(choice):
-    if choice == "ollama":
-        return [OllamaProvider()]
-    if choice == "lmstudio":
-        return [LMStudioProvider()]
-    return [OllamaProvider(), LMStudioProvider()]
+    providers = {
+        "ollama": OllamaProvider,
+        "lmstudio": LMStudioProvider,
+        "mlx": MlxProvider,
+    }
+    if choice in providers:
+        return [providers[choice]()]
+    return [cls() for cls in providers.values()]
 
 
 def gather_records(providers):
@@ -737,11 +973,11 @@ def run_benchmarks(records, active, cache):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="List local models (Ollama + LM Studio) with a cached tokens/sec column."
+        description="List local models (Ollama + LM Studio + mlx-lm) with a cached tokens/sec column."
     )
     parser.add_argument(
         "--provider",
-        choices=("ollama", "lmstudio", "all"),
+        choices=("ollama", "lmstudio", "mlx", "all"),
         default="all",
         help="which backend(s) to query (default: all reachable)",
     )

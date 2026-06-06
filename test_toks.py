@@ -6,7 +6,9 @@ import contextlib
 import importlib.machinery
 import importlib.util
 import io
+import json
 import pathlib
+import tempfile
 import unittest
 
 _PATH = pathlib.Path(__file__).resolve().parent / "toks"
@@ -254,6 +256,228 @@ class OllamaListingTests(unittest.TestCase):
         recs = {r.name: r for r in toks.ollama_parse_models(OLLAMA_TAGS, OLLAMA_INFO)}
         self.assertEqual(recs["scribe:8b"].params, "8B")
         self.assertIn("MoE", recs["vision-mlx:26b-mlx"].params)
+
+
+# ---- mlx listing -----------------------------------------------------------
+
+# Anonymized capture of mlx_lm.server GET /v1/models (ids only).
+MLX_MODELS = {
+    "object": "list",
+    "data": [
+        {"id": "example-org/chat-mini-4bit", "object": "model", "created": 1780000000},
+        {"id": "example-org/router-moe-8bit", "object": "model", "created": 1780000000},
+        {"id": "example-org/image-gen-turbo", "object": "model", "created": 1780000000},
+    ],
+}
+
+
+class MlxListingTests(unittest.TestCase):
+    def test_parses_ids_into_records(self):
+        records = toks.mlx_parse_models(MLX_MODELS)
+        self.assertEqual(len(records), 3)
+        self.assertTrue(all(r.provider == "mlx" for r in records))
+        self.assertEqual(records[0].name, "example-org/chat-mini-4bit")
+
+    def test_records_default_to_mlx_format_and_benchmarkable(self):
+        rec = toks.mlx_parse_models(MLX_MODELS)[0]
+        self.assertEqual(rec.fmt, "mlx")
+        self.assertTrue(rec.benchmarkable)  # remote hosts can't check configs
+
+    def test_metadata_unknown_without_enrichment(self):
+        rec = toks.mlx_parse_models(MLX_MODELS)[0]
+        self.assertIsNone(rec.size_bytes)
+        self.assertEqual(rec.params, "-")
+        self.assertEqual(rec.quant, "-")
+        self.assertIsNone(rec.ctx_max)
+
+    def test_empty_or_missing_data_yields_no_records(self):
+        self.assertEqual(toks.mlx_parse_models({}), [])
+        self.assertEqual(toks.mlx_parse_models({"data": []}), [])
+
+
+# ---- mlx HF-cache enrichment -------------------------------------------------
+
+
+def _make_hub_repo(hub, repo_dir, config, weights=b"w" * 9000):
+    """Build a minimal HF-cache repo: refs/main -> snapshot with blob symlink."""
+    repo = hub / repo_dir
+    (repo / "refs").mkdir(parents=True)
+    (repo / "blobs").mkdir()
+    snapshot = repo / "snapshots" / "abc123"
+    snapshot.mkdir(parents=True)
+    (repo / "refs" / "main").write_text("abc123")
+    blob = repo / "blobs" / "deadbeef"
+    blob.write_bytes(weights)
+    (snapshot / "model.safetensors").symlink_to(blob)
+    if config is not None:
+        (snapshot / "config.json").write_text(json.dumps(config))
+    return snapshot
+
+
+class MlxEnrichmentTests(unittest.TestCase):
+    DENSE_CONFIG = {
+        "model_type": "llama",
+        "architectures": ["LlamaForCausalLM"],
+        "max_position_embeddings": 8192,
+        "quantization": {"group_size": 64, "bits": 4},
+        "vocab_size": 32000,
+    }
+    MOE_CONFIG = {
+        "model_type": "qwen3_next",
+        "architectures": ["Qwen3NextForCausalLM"],
+        "max_position_embeddings": 262144,
+        "quantization": {"group_size": 64, "bits": 8},
+        "num_experts": 8,
+        "num_experts_per_tok": 2,
+    }
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.hub = pathlib.Path(tmp.name)
+        self.dense_snapshot = _make_hub_repo(
+            self.hub, "models--example-org--chat-mini-4bit", self.DENSE_CONFIG)
+        _make_hub_repo(self.hub, "models--example-org--router-moe-8bit",
+                       self.MOE_CONFIG)
+        # Diffusers-style repo: config.json only in a subdirectory.
+        image_snapshot = _make_hub_repo(
+            self.hub, "models--example-org--image-gen-turbo", config=None)
+        (image_snapshot / "text_encoder").mkdir()
+        (image_snapshot / "text_encoder" / "config.json").write_text("{}")
+        self.records = toks.mlx_parse_models(MLX_MODELS)
+        toks.mlx_enrich(self.records, self.hub)
+        self.by_name = {r.name.split("/")[-1]: r for r in self.records}
+
+    def test_size_summed_with_symlinks_resolved(self):
+        rec = self.by_name["chat-mini-4bit"]
+        expected = 9000 + len(json.dumps(self.DENSE_CONFIG))
+        self.assertEqual(rec.size_bytes, expected)
+
+    def test_quant_and_ctx_from_config(self):
+        rec = self.by_name["chat-mini-4bit"]
+        self.assertEqual(rec.quant, "4bit")
+        self.assertEqual(rec.ctx_max, 8192)
+
+    def test_params_estimated_from_size_and_bits(self):
+        self.assertTrue(self.by_name["chat-mini-4bit"].params.startswith("~"))
+
+    def test_moe_detected_with_expert_ratio(self):
+        rec = self.by_name["router-moe-8bit"]
+        self.assertTrue(rec.moe)
+        self.assertIn("MoE 2/8", rec.params)
+        self.assertFalse(self.by_name["chat-mini-4bit"].moe)
+
+    def test_missing_top_level_config_demotes_benchmarkable(self):
+        rec = self.by_name["image-gen-turbo"]
+        self.assertFalse(rec.benchmarkable)
+        self.assertEqual(rec.quant, "-")
+
+    def test_modified_at_set_from_refs_mtime(self):
+        rec = self.by_name["chat-mini-4bit"]
+        self.assertIsNotNone(rec.modified_at)
+        self.assertIsNotNone(toks.parse_modified(rec.modified_at))
+
+    def test_unknown_repo_left_untouched(self):
+        records = [toks.ModelRecord("mlx", "example-org/not-downloaded",
+                                    benchmarkable=True)]
+        toks.mlx_enrich(records, self.hub)
+        self.assertIsNone(records[0].size_bytes)
+        self.assertTrue(records[0].benchmarkable)
+
+    def test_absolute_path_id_enriched_directly(self):
+        records = [toks.ModelRecord("mlx", str(self.dense_snapshot),
+                                    benchmarkable=True)]
+        toks.mlx_enrich(records, self.hub)
+        self.assertEqual(records[0].ctx_max, 8192)
+
+    def test_missing_hub_is_a_noop(self):
+        records = toks.mlx_parse_models(MLX_MODELS)
+        toks.mlx_enrich(records, self.hub / "nonexistent")  # must not raise
+        self.assertIsNone(records[0].size_bytes)
+
+
+# ---- mlx streaming benchmark parse ------------------------------------------
+
+
+class FakeClock:
+    def __init__(self, values):
+        self.values = list(values)
+
+    def __call__(self):
+        return self.values.pop(0)
+
+
+def _sse(*events):
+    return [f"data: {json.dumps(e)}\n".encode() for e in events] + [b"data: [DONE]\n"]
+
+
+class MlxBenchTests(unittest.TestCase):
+    CHUNKS = [
+        {"choices": [{"index": 0, "text": "Hello"}]},
+        {"choices": [{"index": 0, "text": " world"}]},
+        {"choices": [{"index": 0, "text": "!"}]},
+    ]
+    USAGE = {"choices": [],
+             "usage": {"prompt_tokens": 2, "completion_tokens": 12,
+                       "total_tokens": 14}}
+
+    def test_tps_from_usage_tokens_and_chunk_times(self):
+        lines = _sse(*self.CHUNKS, self.USAGE)
+        result = toks.bench_from_sse(lines, start=0.5,
+                                     clock=FakeClock([1.0, 2.0, 3.0]))
+        # 12 tokens streamed between t=1.0 and t=3.0 -> (12-1)/2.0
+        self.assertAlmostEqual(result.tokens_per_second, 5.5)
+        self.assertAlmostEqual(result.time_to_first_token, 0.5)
+
+    def test_falls_back_to_chunk_count_without_usage(self):
+        lines = _sse(*self.CHUNKS)
+        result = toks.bench_from_sse(lines, start=0.0,
+                                     clock=FakeClock([1.0, 2.0, 3.0]))
+        self.assertAlmostEqual(result.tokens_per_second, 1.0)  # (3-1)/2.0
+
+    def test_no_content_chunks_returns_none(self):
+        self.assertIsNone(toks.bench_from_sse(_sse(self.USAGE), start=0.0,
+                                              clock=FakeClock([])))
+
+    def test_single_chunk_has_no_measurable_rate(self):
+        lines = _sse(self.CHUNKS[0], self.USAGE)
+        self.assertIsNone(toks.bench_from_sse(lines, start=0.0,
+                                              clock=FakeClock([1.0])))
+
+    def test_malformed_lines_skipped(self):
+        lines = [b"data: not-json\n", b": comment\n", b"\n"] + _sse(
+            *self.CHUNKS, self.USAGE)
+        result = toks.bench_from_sse(lines, start=0.0,
+                                     clock=FakeClock([1.0, 2.0, 3.0]))
+        self.assertAlmostEqual(result.tokens_per_second, 5.5)
+
+
+# ---- mlx provider wiring -----------------------------------------------------
+
+
+class MlxWiringTests(unittest.TestCase):
+    def test_local_host_detection(self):
+        self.assertTrue(toks.is_local_host("http://localhost:8080"))
+        self.assertTrue(toks.is_local_host("http://127.0.0.1:8080"))
+        self.assertFalse(toks.is_local_host("http://box.example.net:8080"))
+
+    def test_select_providers_mlx(self):
+        providers = toks.select_providers("mlx")
+        self.assertEqual([p.name for p in providers], ["mlx"])
+
+    def test_select_providers_all_includes_mlx(self):
+        providers = toks.select_providers("all")
+        self.assertEqual([p.name for p in providers],
+                         ["ollama", "lmstudio", "mlx"])
+
+    def test_provider_flag_accepts_mlx(self):
+        self.assertEqual(toks.parse_args(["--provider", "mlx"]).provider, "mlx")
+
+    def test_mlx_cache_key_and_migration_idempotent(self):
+        rec = toks.ModelRecord("mlx", "example-org/chat-mini-4bit")
+        self.assertEqual(toks.cache_key(rec), "mlx:example-org/chat-mini-4bit")
+        cache = {toks.cache_key(rec): {"provider": "mlx", "tokens_per_second": 9.0}}
+        self.assertEqual(toks.migrate_cache(cache), cache)
 
 
 # ---- shared rendering helpers ---------------------------------------------
