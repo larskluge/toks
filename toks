@@ -686,12 +686,27 @@ def save_cache(cache):
 # --- orchestration ----------------------------------------------------------
 
 
-def run_benchmarks(records, active, args, cache):
-    """Benchmark the selected records in place; return True if the cache changed."""
+def select_bench_records(records, targets, cache):
+    """Resolve --bench targets to the records to benchmark.
+
+    Empty targets or ["missing"] selects records without a cached tokens/sec
+    value; ["all"] selects everything; anything else is a list of model names.
+    Returns (selected_records, unknown_names).
+    """
+    if not targets or targets == ["missing"]:
+        return [r for r in records if cached_tps(cache, r) is None], []
+    if targets == ["all"]:
+        return list(records), []
+    requested = set(targets)
+    selected = [r for r in records if r.name in requested]
+    unknown = sorted(requested - {r.name for r in selected})
+    return selected, unknown
+
+
+def run_benchmarks(records, active, cache):
+    """Benchmark the given records in place; return True if the cache changed."""
     changed = False
     for rec in records:
-        if args.missing and cached_tps(cache, rec):
-            continue
         if not rec.benchmarkable:
             print(f"skipping {rec.name}: unsupported model type/format", file=sys.stderr)
             continue
@@ -700,7 +715,7 @@ def run_benchmarks(records, active, args, cache):
             continue
         print(f"benchmarking {rec.provider}/{rec.name}...", file=sys.stderr)
         try:
-            result = provider.benchmark(rec, args.prompt, args.max_tokens)
+            result = provider.benchmark(rec, DEFAULT_PROMPT, DEFAULT_MAX_TOKENS)
         except RuntimeError as exc:
             print(f"warning: benchmark failed for {rec.name}: {exc}", file=sys.stderr)
             continue
@@ -713,14 +728,14 @@ def run_benchmarks(records, active, args, cache):
             "tokens_per_second": result.tokens_per_second,
             "time_to_first_token": result.time_to_first_token,
             "benchmarked_at": int(time.time()),
-            "prompt": args.prompt,
-            "max_tokens": args.max_tokens,
+            "prompt": DEFAULT_PROMPT,
+            "max_tokens": DEFAULT_MAX_TOKENS,
         }
         changed = True
     return changed
 
 
-def main():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description="List local models (Ollama + LM Studio) with a cached tokens/sec column."
     )
@@ -730,44 +745,36 @@ def main():
         default="all",
         help="which backend(s) to query (default: all reachable)",
     )
-    parser.add_argument("--bench", action="store_true",
-                        help="benchmark selected models before printing the table")
-    parser.add_argument("--all", action="store_true",
-                        help="with --bench, benchmark all listed models")
-    parser.add_argument("--missing", action="store_true",
-                        help="with --bench, benchmark only models without a cached value")
-    parser.add_argument("--model", action="append",
-                        help="only show or benchmark this model; may be repeated")
-    parser.add_argument("--prompt", default=DEFAULT_PROMPT, help="prompt used for --bench")
-    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS,
-                        help="maximum generated tokens for --bench")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--bench",
+        nargs="*",
+        metavar="TARGET",
+        default=None,
+        help="benchmark before printing the table: no value or 'missing' "
+             "benchmarks models without a cached value, 'all' benchmarks "
+             "every model, anything else names the model(s) to benchmark",
+    )
+    args = parser.parse_args(argv)
+    targets = args.bench or []
+    if len(targets) > 1 and not {"all", "missing"}.isdisjoint(targets):
+        parser.error("--bench: 'all'/'missing' cannot be combined with other targets")
+    return args
 
-    if args.max_tokens <= 0:
-        parser.error("--max-tokens must be greater than zero")
-    if args.bench and args.missing and not args.model:
-        args.all = True
-    if args.all and args.model:
-        parser.error("--all cannot be combined with --model")
-    if args.missing and not args.bench:
-        parser.error("--missing requires --bench")
-    if args.bench and not args.model and not args.all:
-        parser.error("--bench requires --model MODEL or --all")
+
+def main():
+    args = parse_args()
 
     records, active = gather_records(select_providers(args.provider))
     if not active:
         raise RuntimeError("no model providers reachable")
 
-    requested = set(args.model or [])
-    if requested:
-        records = [r for r in records if r.name in requested]
-        missing = sorted(requested - {r.name for r in records})
-        if missing:
-            print(f"warning: model not found: {', '.join(missing)}", file=sys.stderr)
-
     cache = load_cache()
-    if args.bench and run_benchmarks(records, active, args, cache):
-        save_cache(cache)
+    if args.bench is not None:
+        selected, unknown = select_bench_records(records, args.bench, cache)
+        if unknown:
+            print(f"warning: model not found: {', '.join(unknown)}", file=sys.stderr)
+        if run_benchmarks(selected, active, cache):
+            save_cache(cache)
 
     records.sort(key=lambda r: tps_sort_key(cache, r))
     print(table(build_rows(records, cache)))

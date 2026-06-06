@@ -2,8 +2,10 @@
 
 The tool is an extensionless executable, so load it as a module by path.
 """
+import contextlib
 import importlib.machinery
 import importlib.util
+import io
 import pathlib
 import unittest
 
@@ -406,6 +408,111 @@ class BuildRowsTests(unittest.TestCase):
         out = toks.table(rows)
         self.assertIn("PROVIDER", out.splitlines()[0])
         self.assertEqual(len(out.splitlines()), 3)
+
+
+# ---- CLI parsing + benchmark target selection ------------------------------
+
+
+class ParseArgsTests(unittest.TestCase):
+    def _error(self, argv):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                toks.parse_args(argv)
+
+    def test_no_flags_means_no_bench(self):
+        self.assertIsNone(toks.parse_args([]).bench)
+
+    def test_bare_bench_is_empty_target_list(self):
+        self.assertEqual(toks.parse_args(["--bench"]).bench, [])
+
+    def test_bench_accepts_missing_and_all_keywords(self):
+        self.assertEqual(toks.parse_args(["--bench", "missing"]).bench, ["missing"])
+        self.assertEqual(toks.parse_args(["--bench", "all"]).bench, ["all"])
+
+    def test_bench_accepts_model_names(self):
+        args = toks.parse_args(["--bench", "scribe:8b", "router-moe-15b"])
+        self.assertEqual(args.bench, ["scribe:8b", "router-moe-15b"])
+
+    def test_keywords_cannot_combine_with_other_targets(self):
+        self._error(["--bench", "all", "scribe:8b"])
+        self._error(["--bench", "missing", "scribe:8b"])
+        self._error(["--bench", "all", "missing"])
+
+    def test_removed_flags_are_rejected(self):
+        self._error(["--all"])
+        self._error(["--missing"])
+        self._error(["--model", "scribe:8b"])
+        self._error(["--prompt", "hi"])
+        self._error(["--max-tokens", "5"])
+
+    def test_provider_flag_survives(self):
+        self.assertEqual(toks.parse_args(["--provider", "ollama"]).provider, "ollama")
+
+
+class SelectBenchRecordsTests(unittest.TestCase):
+    def setUp(self):
+        self.cache = {"ollama:aaaa1111": {"tokens_per_second": 120.0}}
+        self.cached = toks.ModelRecord("ollama", "scribe:8b", digest="aaaa1111")
+        self.cold = toks.ModelRecord("lmstudio", "router-moe-15b")
+        self.records = [self.cached, self.cold]
+
+    def test_empty_targets_selects_uncached_only(self):
+        selected, unknown = toks.select_bench_records(self.records, [], self.cache)
+        self.assertEqual(selected, [self.cold])
+        self.assertEqual(unknown, [])
+
+    def test_missing_keyword_same_as_empty(self):
+        selected, _ = toks.select_bench_records(self.records, ["missing"], self.cache)
+        self.assertEqual(selected, [self.cold])
+
+    def test_all_selects_everything(self):
+        selected, _ = toks.select_bench_records(self.records, ["all"], self.cache)
+        self.assertEqual(selected, self.records)
+
+    def test_names_select_exact_models_even_if_cached(self):
+        selected, unknown = toks.select_bench_records(
+            self.records, ["scribe:8b"], self.cache)
+        self.assertEqual(selected, [self.cached])
+        self.assertEqual(unknown, [])
+
+    def test_unknown_names_reported(self):
+        selected, unknown = toks.select_bench_records(
+            self.records, ["nope", "scribe:8b"], self.cache)
+        self.assertEqual(selected, [self.cached])
+        self.assertEqual(unknown, ["nope"])
+
+
+class RunBenchmarksTests(unittest.TestCase):
+    class FakeProvider:
+        def __init__(self):
+            self.calls = []
+
+        def benchmark(self, rec, prompt, max_tokens):
+            self.calls.append((rec.name, prompt, max_tokens))
+            return toks.BenchResult(42.0, 0.1)
+
+    def test_benchmarks_with_default_prompt_and_tokens(self):
+        rec = toks.ModelRecord("ollama", "scribe:8b", digest="aaaa1111",
+                               benchmarkable=True)
+        provider = self.FakeProvider()
+        cache = {}
+        with contextlib.redirect_stderr(io.StringIO()):
+            changed = toks.run_benchmarks([rec], {"ollama": provider}, cache)
+        self.assertTrue(changed)
+        self.assertEqual(provider.calls,
+                         [("scribe:8b", toks.DEFAULT_PROMPT, toks.DEFAULT_MAX_TOKENS)])
+        entry = cache["ollama:aaaa1111"]
+        self.assertAlmostEqual(entry["tokens_per_second"], 42.0)
+        self.assertEqual(entry["max_tokens"], toks.DEFAULT_MAX_TOKENS)
+
+    def test_non_benchmarkable_is_skipped(self):
+        rec = toks.ModelRecord("lmstudio", "tiny-embedder", benchmarkable=False)
+        provider = self.FakeProvider()
+        cache = {}
+        with contextlib.redirect_stderr(io.StringIO()):
+            changed = toks.run_benchmarks([rec], {"lmstudio": provider}, cache)
+        self.assertFalse(changed)
+        self.assertEqual(provider.calls, [])
 
 
 class HostNormalizationTests(unittest.TestCase):

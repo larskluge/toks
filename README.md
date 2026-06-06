@@ -14,12 +14,11 @@ ollama    gpt-oss:120b     60.9 GB  gguf moe  117B…   131072  0.402     79.6  
 ## Usage
 
 ```
-toks                                  # list models from all reachable backends
-toks --provider ollama                # one backend only (ollama | lmstudio | all)
-toks --bench --all                    # benchmark every model, cache the result
-toks --bench --missing                # benchmark only models with no cached value
-toks --bench --model qwen3.6:27b-mlx  # benchmark a single model (repeatable)
-toks --bench --all --max-tokens 256 --prompt "..."   # tune the benchmark run
+toks                            # list models from all reachable backends
+toks --provider ollama          # one backend only (ollama | lmstudio | all)
+toks --bench                    # benchmark models with no cached value (= --bench missing)
+toks --bench all                # benchmark every model, cache the result
+toks --bench qwen3.6:27b-mlx    # benchmark the named model(s)
 ```
 
 Benchmarks are cached at `~/.cache/toks/tokens-per-second.json`, so plain `toks`
