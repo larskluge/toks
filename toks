@@ -1005,15 +1005,18 @@ def main():
         raise RuntimeError("no model providers reachable")
 
     cache = load_cache()
+    display = records
     if args.bench is not None:
         selected, unknown = select_bench_records(records, args.bench, cache)
         if unknown:
             print(f"warning: model not found: {', '.join(unknown)}", file=sys.stderr)
         if run_benchmarks(selected, active, cache):
             save_cache(cache)
+        # With --bench, print only the targeted models, not the whole listing.
+        display = selected
 
-    records.sort(key=lambda r: tps_sort_key(cache, r))
-    print(table(build_rows(records, cache)))
+    display.sort(key=lambda r: tps_sort_key(cache, r))
+    print(table(build_rows(display, cache)))
 
 
 if __name__ == "__main__":

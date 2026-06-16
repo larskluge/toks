@@ -46,6 +46,9 @@ toks --bench MODEL [MODEL...] # benchmark the named model(s)
 
 - `--bench MODEL` benchmarks the named models, then prints the **full**
   table (the old `--model` also filtered the display; that's gone).
+  **Superseded 2026-06-16:** `--bench` now prints only the benchmarked
+  models (the missing set / `all` / the named models); plain `toks` still
+  lists everything. This restores display filtering for `--bench`.
 - Unknown model names still warn on stderr (`warning: model not found: ...`).
 - Missing mode still skips models with a cached value; non-benchmarkable
   models still print the `skipping ...: unsupported model type/format` note.

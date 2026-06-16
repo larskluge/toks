@@ -8,8 +8,10 @@ import importlib.util
 import io
 import json
 import pathlib
+import sys
 import tempfile
 import unittest
+from unittest import mock
 
 _PATH = pathlib.Path(__file__).resolve().parent / "toks"
 _loader = importlib.machinery.SourceFileLoader("toks", str(_PATH))
@@ -753,6 +755,51 @@ class HostNormalizationTests(unittest.TestCase):
     def test_uses_default_when_empty(self):
         self.assertEqual(toks.normalize_host(None, "http://127.0.0.1:11434"),
                          "http://127.0.0.1:11434")
+
+
+class MainDisplayTests(unittest.TestCase):
+    """--bench restricts the printed table to the benchmarked models."""
+
+    def _records(self):
+        fast = toks.ModelRecord("ollama", "fast-model", digest="d1")
+        cold = toks.ModelRecord("lmstudio", "cold-model")
+        return [fast, cold]
+
+    def _run_main(self, argv):
+        records = self._records()
+        cache = {"ollama:d1": {"tokens_per_second": 100.0}}
+        # Records default to benchmarkable=False, so run_benchmarks skips them;
+        # active only needs to be non-empty to clear the reachability guard.
+        active = {"ollama": object(), "lmstudio": object()}
+        out = io.StringIO()
+        with mock.patch.object(toks, "gather_records", return_value=(records, active)), \
+                mock.patch.object(toks, "load_cache", return_value=cache), \
+                mock.patch.object(toks, "save_cache"), \
+                mock.patch.object(sys, "argv", ["toks", *argv]), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(io.StringIO()):
+            toks.main()
+        return out.getvalue()
+
+    def test_no_bench_shows_all_rows(self):
+        output = self._run_main([])
+        self.assertIn("fast-model", output)
+        self.assertIn("cold-model", output)
+
+    def test_bench_missing_shows_only_benched_rows(self):
+        output = self._run_main(["--bench"])
+        self.assertIn("cold-model", output)
+        self.assertNotIn("fast-model", output)
+
+    def test_bench_all_shows_all_rows(self):
+        output = self._run_main(["--bench", "all"])
+        self.assertIn("fast-model", output)
+        self.assertIn("cold-model", output)
+
+    def test_bench_named_shows_only_named_row(self):
+        output = self._run_main(["--bench", "fast-model"])
+        self.assertIn("fast-model", output)
+        self.assertNotIn("cold-model", output)
 
 
 if __name__ == "__main__":

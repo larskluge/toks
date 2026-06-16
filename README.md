@@ -27,6 +27,10 @@ Benchmarks are cached at `~/.cache/toks/tokens-per-second.json`, so plain `toks`
 is instant and the TOKENS/S / TTFT columns persist between runs. Rows are sorted
 fastest-first; un-benchmarked models sort last.
 
+With `--bench`, the printed table is restricted to the models that were
+benchmarked (the missing set, `all`, or the named models). Run plain `toks` to
+see the full listing.
+
 For Ollama, throughput is computed from the `/api/generate` eval counters. For LM
 Studio, `tokens_per_second` and `time_to_first_token` are read straight from the
 server's own `stats` — so benchmarking a **remote** LM Studio (e.g. on another host)
