@@ -221,6 +221,19 @@ def human_size(size):
     return "-"
 
 
+def human_ctx(ctx):
+    try:
+        value = float(ctx)
+    except (TypeError, ValueError):
+        return "-"
+    if value <= 0:
+        return "-"
+    k = value / 1024
+    if k < 1024:
+        return f"{k:.0f}k"
+    return f"{k / 1024:.1f}".rstrip("0").rstrip(".") + "M"
+
+
 def quant_bits_per_weight(quant):
     # Approximate stored bits per weight (payload + quant scales) for the
     # quantization levels Ollama reports. Used to sanity-check and, when
@@ -616,7 +629,7 @@ def build_rows(records, cache):
             human_size(rec.size_bytes),
             tag_cell(rec),
             rec.params or "-",
-            str(ctx) if ctx else "-",
+            human_ctx(ctx),
             f"{ttft:.2f}" if ttft else "-",
             f"{tps:.1f}" if tps else "-",
             human_age(rec.modified_at) if rec.modified_at else "-",

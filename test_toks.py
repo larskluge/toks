@@ -512,6 +512,18 @@ class FormattingHelperTests(unittest.TestCase):
     def test_quant_bits_per_weight_q4(self):
         self.assertEqual(toks.quant_bits_per_weight("Q4_K_M"), 4.5)
 
+    def test_human_ctx_dash_for_none_and_zero(self):
+        self.assertEqual(toks.human_ctx(None), "-")
+        self.assertEqual(toks.human_ctx(0), "-")
+
+    def test_human_ctx_kilo(self):
+        self.assertEqual(toks.human_ctx(131072), "128k")
+
+    def test_human_ctx_rolls_over_to_mega(self):
+        self.assertEqual(toks.human_ctx(1048576), "1M")       # 1024k -> 1M
+        self.assertEqual(toks.human_ctx(1572864), "1.5M")
+        self.assertEqual(toks.human_ctx(10485760), "10M")     # not 10240k
+
 
 # ---- cache key + migration + lookup ---------------------------------------
 
@@ -618,7 +630,7 @@ class BuildRowsTests(unittest.TestCase):
         self.assertEqual(cell["SIZE"], "-")            # unknown for LM Studio v0
         self.assertEqual(cell["TOKENS/S"], "188.0")
         self.assertEqual(cell["TTFT"], "0.11")
-        self.assertEqual(cell["CTX"], "8192")          # loaded ctx preferred
+        self.assertEqual(cell["CTX"], "8k")            # loaded ctx preferred
         self.assertEqual(cell["MODIFIED"], "-")
 
     def test_ollama_row_uncached_shows_dashes(self):
@@ -626,7 +638,7 @@ class BuildRowsTests(unittest.TestCase):
         cell = dict(zip(rows[0], rows[2]))             # scribe:8b, not cached
         self.assertEqual(cell["TOKENS/S"], "-")
         self.assertEqual(cell["TTFT"], "-")
-        self.assertEqual(cell["CTX"], "40960")         # max ctx fallback
+        self.assertEqual(cell["CTX"], "40k")           # max ctx fallback
         self.assertEqual(cell["SIZE"], "4.4 GB")
 
     def test_table_renders_aligned_string(self):

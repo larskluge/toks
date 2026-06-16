@@ -6,11 +6,11 @@ Python 3 standard library only.
 
 ```
 $ toks
-PROVIDER  NAME             SIZE     TAG       PARAMS  CTX     TTFT  TOKENS/S  MODIFIED
-mlx       org/chat-3b      1.7 GB   mlx       ~3B     131072  0.09     204.2  19 minutes ago
-lmstudio  qwen3-8b-mlx     -        mlx       8B      32768   0.11     188.0  -
-ollama    qwen3.6:35b-mlx  20.4 GB  mlx moe   35B     262144  0.18     129.5  1 day ago
-ollama    gpt-oss:120b     60.9 GB  gguf moe  117B…   131072  0.402     79.6  2 hours ago
+PROVIDER  NAME                SIZE  TAG       PARAMS   CTX   TTFT  TOKENS/S  MODIFIED
+mlx       org/chat-3b       1.7 GB  mlx          ~3B  128k   0.09     204.2  19 minutes ago
+lmstudio  qwen3-8b-mlx           -  mlx           8B   32k   0.11     188.0  -
+ollama    qwen3.6:35b-mlx  20.4 GB  mlx moe      35B  256k   0.18     129.5  1 day ago
+ollama    gpt-oss:120b     60.9 GB  gguf moe   117B…  128k  0.402      79.6  2 hours ago
 ```
 
 ## Usage
