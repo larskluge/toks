@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
-"""toks - list local models (Ollama + LM Studio + mlx-lm) with a cached tokens/sec column.
+"""toks - list local models with cached tokens/sec and bits/weight columns.
 
-Single-file, standard-library only. See
+Backends: Ollama, LM Studio, mlx-lm, and Unsloth Studio. Single-file,
+standard-library only. See
 docs/superpowers/specs/2026-05-31-toks-lmstudio-provider-design.md
 docs/superpowers/specs/2026-06-06-mlx-provider-design.md
+docs/specs/2026-06-24-unsloth-studio-provider-and-bpw-design.md
 """
 import argparse
 import concurrent.futures
 import json
 import os
+import struct
 import sys
 import time
 import urllib.error
@@ -22,6 +25,7 @@ from pathlib import Path
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_LMSTUDIO_URL = "http://localhost:1234"
 DEFAULT_MLX_URL = "http://localhost:8080"
+DEFAULT_UNSLOTH_URL = "http://127.0.0.1:8888"
 DEFAULT_PROMPT = "Write one concise paragraph about local language models."
 DEFAULT_MAX_TOKENS = 128
 
@@ -55,6 +59,8 @@ class ModelRecord:
     ctx_loaded: int | None = None
     benchmarkable: bool = False
     digest: str | None = None           # stable id for cache key (Ollama digest)
+    param_count: int | None = None      # numeric total params (real or estimated)
+    param_estimated: bool = False       # True when param_count derived from size
     raw: dict = field(default_factory=dict)
 
 
@@ -263,6 +269,27 @@ def human_params(total, expert_count, expert_used):
     return f"{total_b:.0f}B"
 
 
+def effective_bpw(rec):
+    """Effective bits per weight: on-disk bits / parameter count, else None.
+
+    Exact when param_count is a real reported/parsed value; for size-estimated
+    counts it merely recovers the assumed width (flagged via param_estimated).
+    """
+    size = rec.size_bytes
+    count = rec.param_count
+    if not size or not count or size <= 0 or count <= 0:
+        return None
+    return (float(size) * 8.0) / float(count)
+
+
+def human_bpw(rec):
+    bpw = effective_bpw(rec)
+    if bpw is None:
+        return "-"
+    prefix = "~" if rec.param_estimated else ""
+    return f"{prefix}{bpw:.2f}"
+
+
 # --- Ollama provider parsing ------------------------------------------------
 
 
@@ -291,7 +318,14 @@ def is_moe(model, info):
     return _looks_moe(arch, family, families)
 
 
-def ollama_params(model, info):
+def ollama_param_count(model, info):
+    """Resolve (total, estimated, expert_count, expert_used) for a model.
+
+    Prefers general.parameter_count; discards it when the implied bits/weight
+    far exceeds the quant's nominal width (some MLX/safetensors models ship a
+    bogus count) and estimates from on-disk size instead. `estimated` is True
+    only on that size-derived fallback.
+    """
     total = None
     expert_count = None
     expert_used = None
@@ -320,6 +354,11 @@ def ollama_params(model, info):
         total = int(float(size) * 8.0 / bpw)
         estimated = True
 
+    return total, estimated, expert_count, expert_used
+
+
+def ollama_params(model, info):
+    total, estimated, expert_count, expert_used = ollama_param_count(model, info)
     text = human_params(total, expert_count, expert_used)
     if estimated and text != "-":
         text = "~" + text
@@ -348,12 +387,18 @@ def ollama_parse_models(tags_models, info_map):
         info = (info_map or {}).get(name, {}) or {}
         fmt = model_format(model)
         details = model.get("details") or {}
+        total, estimated, expert_count, expert_used = ollama_param_count(model, info)
+        params_text = human_params(total, expert_count, expert_used)
+        if estimated and params_text != "-":
+            params_text = "~" + params_text
         records.append(
             ModelRecord(
                 provider="ollama",
                 name=name,
                 fmt=fmt,
-                params=ollama_params(model, info),
+                params=params_text,
+                param_count=total,
+                param_estimated=estimated,
                 moe=is_moe(model, info),
                 quant=details.get("quantization_level") or "-",
                 size_bytes=model.get("size"),
@@ -469,6 +514,8 @@ def mlx_enrich(records, hub_root):
         )
         if rec.size_bytes:
             total = int(float(rec.size_bytes) * 8.0 / bpw)
+            rec.param_count = total
+            rec.param_estimated = True   # always size-derived for MLX repos
             text = human_params(
                 total, config.get("num_experts"), config.get("num_experts_per_tok"))
             if text != "-":
@@ -525,6 +572,267 @@ def bench_from_sse(lines, start, clock=time.monotonic):
     return BenchResult((tokens - 1) / (last - first), first - start)
 
 
+# --- Unsloth Studio provider parsing (llama.cpp server) ----------------------
+
+# GGUF general.file_type enum -> quant label (ggml ftype values).
+GGUF_FILE_TYPES = {
+    0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 7: "Q8_0", 8: "Q5_0",
+    9: "Q5_1", 10: "Q2_K", 11: "Q3_K_S", 12: "Q3_K_M", 13: "Q3_K_L",
+    14: "Q4_K_S", 15: "Q4_K_M", 16: "Q5_K_S", 17: "Q5_K_M", 18: "Q6_K",
+    19: "IQ2_XXS", 20: "IQ2_XS", 21: "Q2_K_S", 22: "IQ3_XS", 23: "IQ3_XXS",
+    24: "IQ1_S", 25: "IQ4_NL", 26: "IQ3_S", 27: "IQ3_M", 28: "IQ2_S",
+    29: "IQ2_M", 30: "IQ4_XS", 31: "IQ1_M", 32: "BF16",
+}
+
+_GGUF_SIMPLE = {0: "<b", 1: "<B", 2: "<h", 3: "<H", 4: "<i", 5: "<I",
+                6: "<f", 7: "<?", 10: "<q", 11: "<Q", 12: "<d"}
+
+
+def _gguf_read_value(handle, vtype):
+    fmt = _GGUF_SIMPLE.get(vtype)
+    if fmt is not None:
+        return struct.unpack(fmt, handle.read(struct.calcsize(fmt)))[0]
+    if vtype == 8:                                   # string
+        (length,) = struct.unpack("<Q", handle.read(8))
+        return handle.read(length).decode("utf-8", "replace")
+    if vtype == 9:                                   # array
+        (elem_type,) = struct.unpack("<I", handle.read(4))
+        (count,) = struct.unpack("<Q", handle.read(8))
+        return [_gguf_read_value(handle, elem_type) for _ in range(count)]
+    raise ValueError(f"unknown GGUF value type {vtype}")
+
+
+def read_gguf_meta(path):
+    """Parse a GGUF header for param count, quant, context length, and MoE flags.
+
+    Sums tensor-info dimension products for an *exact* parameter count (tensor
+    data itself is never read); reads general.file_type for the quant label and
+    the architecture's context_length. Returns a dict, or None on any malformed
+    or unreadable input -- callers treat enrichment as best-effort.
+    """
+    try:
+        with open(path, "rb") as handle:
+            if handle.read(4) != b"GGUF":
+                return None
+            (version,) = struct.unpack("<I", handle.read(4))
+            if version < 2:
+                return None
+            (n_tensors,) = struct.unpack("<Q", handle.read(8))
+            (n_kv,) = struct.unpack("<Q", handle.read(8))
+            arch = None
+            file_type = None
+            expert_count = None
+            expert_used = None
+            ctx_by_key = {}
+            for _ in range(n_kv):
+                (klen,) = struct.unpack("<Q", handle.read(8))
+                key = handle.read(klen).decode("utf-8", "replace")
+                (vtype,) = struct.unpack("<I", handle.read(4))
+                value = _gguf_read_value(handle, vtype)
+                if key == "general.architecture":
+                    arch = value
+                elif key == "general.file_type":
+                    file_type = value
+                elif key.endswith(".expert_count"):
+                    expert_count = value
+                elif key.endswith(".expert_used_count"):
+                    expert_used = value
+                elif key.endswith(".context_length"):
+                    ctx_by_key[key] = value
+            total = 0
+            for _ in range(n_tensors):
+                (nlen,) = struct.unpack("<Q", handle.read(8))
+                handle.read(nlen)                    # tensor name
+                (ndims,) = struct.unpack("<I", handle.read(4))
+                dims = struct.unpack(f"<{ndims}Q", handle.read(8 * ndims))
+                handle.read(4)                       # ggml type
+                handle.read(8)                       # data offset
+                product = 1
+                for dim in dims:
+                    product *= dim
+                total += product
+    except (OSError, struct.error, ValueError, UnicodeDecodeError):
+        return None
+    if total <= 0:
+        return None
+    ctx = ctx_by_key.get(f"{arch}.context_length") if arch else None
+    if ctx is None and ctx_by_key:
+        ctx = next(iter(ctx_by_key.values()))
+    quant = GGUF_FILE_TYPES.get(file_type)
+    if quant is None and file_type is not None:
+        quant = f"ftype{file_type}"
+    return {
+        "param_count": total,
+        "file_type": file_type,
+        "quant": quant,
+        "ctx": ctx if isinstance(ctx, int) and ctx > 0 else None,
+        "expert_count": expert_count,
+        "expert_used": expert_used,
+    }
+
+
+def select_main_gguf(snapshot):
+    """Pick the main weights GGUF in a snapshot, ignoring projector/draft files.
+
+    A repo may ship the weights file plus extras (mmproj-* vision projectors, an
+    mtp-* draft head); the largest *.gguf that is neither is the model itself.
+    """
+    candidates = []
+    try:
+        for path in snapshot.glob("*.gguf"):
+            lowered = path.name.lower()
+            if "mmproj" in lowered or "mtp" in lowered:
+                continue
+            try:
+                candidates.append((path.stat().st_size, path))
+            except OSError:
+                continue
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+def unsloth_parse_models(payload):
+    """Parse a GET /v1/models response from Unsloth Studio into ModelRecords.
+
+    Like mlx, the listing carries only model ids (HF repo ids); GGUF metadata is
+    backfilled from the local HF cache by unsloth_enrich.
+    """
+    data = (payload or {}).get("data")
+    if not isinstance(data, list):
+        return []
+    records = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id")
+        if not model_id:
+            continue
+        records.append(
+            ModelRecord(
+                provider="unsloth",
+                name=model_id,
+                benchmarkable=True,
+                raw=item,
+            )
+        )
+    return records
+
+
+def unsloth_enrich(records, hub_root):
+    """Backfill size/quant/params/ctx/MoE from each model's cached GGUF.
+
+    Meaningful only when toks runs on the server's machine (the default localhost
+    setup). Reads the main weights GGUF's header; absent repos or malformed files
+    leave the record untouched -- never raises.
+    """
+    for rec in records:
+        snapshot, ref = _mlx_snapshot(hub_root, rec.name)
+        if snapshot is None:
+            continue
+        main = select_main_gguf(snapshot)
+        if main is None:
+            continue
+        try:
+            rec.size_bytes = main.stat().st_size
+        except OSError:
+            pass
+        if ref is not None:
+            try:
+                mtime = ref.stat().st_mtime
+                rec.modified_at = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+            except OSError:
+                pass
+        meta = read_gguf_meta(main)
+        if not meta:
+            continue
+        rec.fmt = "gguf"
+        if meta["quant"]:
+            rec.quant = meta["quant"]
+        if meta["ctx"]:
+            rec.ctx_max = meta["ctx"]
+        expert_count = meta["expert_count"]
+        rec.moe = bool(isinstance(expert_count, int) and expert_count > 1)
+        rec.param_count = meta["param_count"]
+        rec.param_estimated = False      # exact, summed from the tensor table
+        rec.params = human_params(meta["param_count"], expert_count, meta["expert_used"])
+
+
+def parse_llamacpp_timings(response):
+    """Read server-measured throughput from a llama.cpp `timings` block.
+
+    Unsloth Studio (a llama.cpp server) reports predicted_per_second and
+    prompt_ms in the stream's final chunk -- accurate even over a network, so we
+    prefer it to client-side timing. Returns None when absent or non-positive.
+    """
+    timings = (response or {}).get("timings")
+    if not isinstance(timings, dict):
+        return None
+    tps = timings.get("predicted_per_second")
+    if not isinstance(tps, (int, float)) or tps <= 0:
+        return None
+    ttft = None
+    prompt_ms = timings.get("prompt_ms")
+    if isinstance(prompt_ms, (int, float)) and prompt_ms > 0:
+        ttft = float(prompt_ms) / 1000.0
+    return BenchResult(float(tps), ttft)
+
+
+def bench_unsloth_sse(lines, start, clock=time.monotonic):
+    """Time an Unsloth Studio completion stream in a single live pass.
+
+    Prefers the server's own llama.cpp `timings` (the first chunk to carry one);
+    falls back to client-side timing (TTFT = first content chunk, throughput over
+    the first->last interval) if a build ever omits timings. Returns None when
+    nothing measurable arrived.
+    """
+    first = last = None
+    chunk_count = 0
+    completion_tokens = None
+    server = None
+    for raw in lines:
+        line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        line = line.strip()
+        if not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if server is None:
+            server = parse_llamacpp_timings(event)
+        usage = event.get("usage")
+        if isinstance(usage, dict):
+            tokens = usage.get("completion_tokens")
+            if isinstance(tokens, int) and tokens > 0:
+                completion_tokens = tokens
+        choices = event.get("choices") or []
+        content = ""
+        if choices and isinstance(choices[0], dict):
+            content = (choices[0].get("text")
+                       or (choices[0].get("delta") or {}).get("content") or "")
+        if content:
+            now = clock()
+            if first is None:
+                first = now
+            last = now
+            chunk_count += 1
+    if server is not None:
+        return server
+    if first is None or last <= first:
+        return None
+    tokens = completion_tokens or chunk_count
+    if tokens < 2:
+        return None
+    return BenchResult((tokens - 1) / (last - first), first - start)
+
+
 # --- shared rendering -------------------------------------------------------
 
 
@@ -543,7 +851,7 @@ def tag_cell(rec):
 
 # --- benchmark cache --------------------------------------------------------
 
-_PROVIDER_PREFIXES = ("ollama:", "lmstudio:", "mlx:")
+_PROVIDER_PREFIXES = ("ollama:", "lmstudio:", "mlx:", "unsloth:")
 
 
 def cache_key(rec):
@@ -612,9 +920,9 @@ def tps_sort_key(cache, rec):
 
 # --- table rendering --------------------------------------------------------
 
-HEADER = ["PROVIDER", "NAME", "SIZE", "TAG", "PARAMS", "CTX", "TTFT",
+HEADER = ["PROVIDER", "NAME", "SIZE", "TAG", "PARAMS", "BPW", "CTX", "TTFT",
           "TOKENS/S", "MODIFIED"]
-RIGHT_ALIGN = {"SIZE", "PARAMS", "CTX", "TTFT", "TOKENS/S"}
+RIGHT_ALIGN = {"SIZE", "PARAMS", "BPW", "CTX", "TTFT", "TOKENS/S"}
 
 
 def build_rows(records, cache):
@@ -629,6 +937,7 @@ def build_rows(records, cache):
             human_size(rec.size_bytes),
             tag_cell(rec),
             rec.params or "-",
+            human_bpw(rec),
             human_ctx(ctx),
             f"{ttft:.2f}" if ttft else "-",
             f"{tps:.1f}" if tps else "-",
@@ -682,6 +991,15 @@ def mlx_url():
     return normalize_host(os.environ.get("MLX_URL"), DEFAULT_MLX_URL)
 
 
+def unsloth_url():
+    return normalize_host(os.environ.get("UNSLOTH_URL"), DEFAULT_UNSLOTH_URL)
+
+
+def unsloth_headers():
+    token = os.environ.get("UNSLOTH_API_KEY")
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 def is_local_host(url):
     """True when the URL points at this machine (HF-cache enrichment works)."""
     return urllib.parse.urlsplit(url).hostname in ("localhost", "127.0.0.1", "::1")
@@ -698,6 +1016,42 @@ def hf_hub_root():
     return Path.home() / ".cache" / "huggingface" / "hub"
 
 
+def config_dir():
+    """The user config dir, honoring XDG_CONFIG_HOME (default ~/.config)."""
+    base = os.environ.get("XDG_CONFIG_HOME")
+    return Path(base) if base else Path.home() / ".config"
+
+
+def load_dotenv(path=None):
+    """Populate os.environ from ~/.config/toks/.env -- read-only, never writes.
+
+    A real environment variable always wins (only absent keys are set). Blank
+    lines and `#` comments are skipped; a leading `export` and surrounding
+    single/double quotes are stripped. Missing/unreadable files are a no-op.
+    """
+    if path is None:
+        path = config_dir() / "toks" / ".env"
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except OSError:
+        return
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[len("export "):].lstrip()
+        key, sep, value = line.partition("=")
+        if not sep:
+            continue
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
 def http_json(url, payload=None, headers=None, timeout=120):
     data = None
     hdrs = dict(headers or {})
@@ -711,7 +1065,8 @@ def http_json(url, payload=None, headers=None, timeout=120):
     except urllib.error.HTTPError as exc:
         if exc.code == 401:
             raise RuntimeError(
-                f"{url} returned 401 (set LMSTUDIO_API_KEY / LM_API_TOKEN?)"
+                f"{url} returned 401 (missing/invalid API key? "
+                "e.g. LMSTUDIO_API_KEY / UNSLOTH_API_KEY)"
             ) from exc
         raise RuntimeError(f"{url} returned HTTP {exc.code}") from exc
     except urllib.error.URLError as exc:
@@ -720,11 +1075,13 @@ def http_json(url, payload=None, headers=None, timeout=120):
         raise RuntimeError(f"invalid JSON from {url}") from exc
 
 
-def http_sse(url, payload, timeout):
+def http_sse(url, payload, timeout, headers=None):
     """POST a JSON payload and yield the raw SSE response lines."""
     data = json.dumps(payload).encode("utf-8")
-    request = urllib.request.Request(
-        url, data=data, headers={"Content-Type": "application/json"})
+    hdrs = {"Content-Type": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    request = urllib.request.Request(url, data=data, headers=hdrs)
     try:
         with _OPENER.open(request, timeout=timeout) as response:
             yield from response
@@ -867,11 +1224,53 @@ class MlxProvider:
         return bench_from_sse(lines, start)
 
 
+class UnslothProvider:
+    name = "unsloth"
+
+    def __init__(self):
+        self.host = unsloth_url()
+        self.headers = unsloth_headers()
+
+    def list_models(self):
+        data = http_json(f"{self.host}/v1/models", headers=self.headers, timeout=LIST_TIMEOUT)
+        records = unsloth_parse_models(data)
+        # Listing is ids-only; the GGUF metadata lives in the HF cache, readable
+        # only when Studio runs on this machine (the default localhost setup).
+        if records and is_local_host(self.host):
+            unsloth_enrich(records, hf_hub_root())
+        return records
+
+    def benchmark(self, rec, prompt, max_tokens):
+        # Unsloth Studio is a llama.cpp server: a 1-token warmup absorbs any load
+        # time, then we read its server-side `timings` from the stream (falling
+        # back to client-side timing). Auth token rides on every request.
+        warmup = {"model": rec.name, "prompt": prompt, "max_tokens": 1,
+                  "stream": False, "temperature": 0}
+        try:
+            http_json(f"{self.host}/v1/completions", payload=warmup,
+                      headers=self.headers, timeout=BENCH_TIMEOUT)
+        except RuntimeError:
+            pass
+        payload = {
+            "model": rec.name,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "temperature": 0,
+        }
+        start = time.monotonic()
+        lines = http_sse(f"{self.host}/v1/completions", payload, BENCH_TIMEOUT,
+                         headers=self.headers)
+        return bench_unsloth_sse(lines, start)
+
+
 def select_providers(choice):
     providers = {
         "ollama": OllamaProvider,
         "lmstudio": LMStudioProvider,
         "mlx": MlxProvider,
+        "unsloth": UnslothProvider,
     }
     if choice in providers:
         return [providers[choice]()]
@@ -986,11 +1385,12 @@ def run_benchmarks(records, active, cache):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="List local models (Ollama + LM Studio + mlx-lm) with a cached tokens/sec column."
+        description="List local models (Ollama + LM Studio + mlx-lm + Unsloth Studio) "
+                    "with cached tokens/sec and bits/weight columns."
     )
     parser.add_argument(
         "--provider",
-        choices=("ollama", "lmstudio", "mlx", "all"),
+        choices=("ollama", "lmstudio", "mlx", "unsloth", "all"),
         default="all",
         help="which backend(s) to query (default: all reachable)",
     )
@@ -1012,6 +1412,7 @@ def parse_args(argv=None):
 
 def main():
     args = parse_args()
+    load_dotenv()   # read-only: ~/.config/toks/.env, real env vars win
 
     records, active = gather_records(select_providers(args.provider))
     if not active:

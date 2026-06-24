@@ -1,23 +1,30 @@
 # toks
 
-List local LLMs across backends — **Ollama**, **LM Studio**, and **mlx-lm**
-(`mlx_lm.server`) — in one table, ranked by cached tokens/sec. Single file,
-Python 3 standard library only.
+List local LLMs across backends — **Ollama**, **LM Studio**, **mlx-lm**
+(`mlx_lm.server`), and **Unsloth Studio** — in one table, ranked by cached
+tokens/sec and annotated with effective **bits/weight**. Single file, Python 3
+standard library only.
 
 ```
 $ toks
-PROVIDER  NAME                SIZE  TAG       PARAMS   CTX   TTFT  TOKENS/S  MODIFIED
-mlx       org/chat-3b       1.7 GB  mlx          ~3B  128k   0.09     204.2  19 minutes ago
-lmstudio  qwen3-8b-mlx           -  mlx           8B   32k   0.11     188.0  -
-ollama    qwen3.6:35b-mlx  20.4 GB  mlx moe      35B  256k   0.18     129.5  1 day ago
-ollama    gpt-oss:120b     60.9 GB  gguf moe   117B…  128k  0.402      79.6  2 hours ago
+PROVIDER  NAME                            SIZE  TAG   PARAMS   BPW   CTX  TTFT  TOKENS/S  MODIFIED
+unsloth   unsloth/gemma-4-31B-it-GGUF  17.1 GB  gguf     31B  4.78  256k  0.10      39.6  2 hours ago
+ollama    gemma4:31b-mlx               18.8 GB  mlx      31B  5.18  256k  0.37      25.0  3 weeks ago
 ```
+
+The **`BPW`** column is on-disk bits ÷ parameter count — the *effective* width,
+which can differ sharply from the quant's nominal one. Above, two 31B Gemma-4
+builds tagged the same `31B` separate cleanly: the Q4_K_M GGUF at **4.78** vs the
+MLX `nvfp4` build at **5.18** (FP4 weights still carry FP8 block scales). BPW is
+exact when the parameter count is known precisely (Ollama, Unsloth's GGUF
+header); a leading `~` marks counts estimated from file size. `SIZE` is binary
+(GiB), so the GGUF's 18.3 GB on disk shows as `17.1 GB` while `BPW` uses raw bytes.
 
 ## Usage
 
 ```
 toks                            # list models from all reachable backends
-toks --provider ollama          # one backend only (ollama | lmstudio | mlx | all)
+toks --provider ollama          # one backend only (ollama | lmstudio | mlx | unsloth | all)
 toks --bench                    # benchmark models with no cached value (= --bench missing)
 toks --bench all                # benchmark every model, cache the result
 toks --bench qwen3.6:27b-mlx    # benchmark the named model(s)
@@ -37,7 +44,9 @@ server's own `stats` — so benchmarking a **remote** LM Studio (e.g. on another
 stays accurate, since those numbers are measured server-side. mlx-lm reports no
 server-side stats, so `toks` times the SSE stream client-side (TTFT = first chunk,
 throughput over the first→last chunk interval) — accurate for the localhost default;
-over a network, latency leaks into the numbers.
+over a network, latency leaks into the numbers. Unsloth Studio is a llama.cpp
+server, so `toks` reads its server-measured `timings` (`predicted_per_second`,
+`prompt_ms`) from the stream — accurate even over a network.
 
 ## Configuration
 
@@ -47,10 +56,19 @@ over a network, latency leaks into the numbers.
 | `LMSTUDIO_URL` | `http://localhost:1234` | LM Studio endpoint; set to a URL for a remote host, e.g. `http://box.example.net:1234` |
 | `LMSTUDIO_API_KEY` / `LM_API_TOKEN` | — | optional `Authorization: Bearer` token |
 | `MLX_URL` | `http://localhost:8080` | mlx_lm.server endpoint |
-| `HF_HUB_CACHE` / `HF_HOME` | `~/.cache/huggingface/hub` | HF cache used for mlx metadata enrichment |
+| `UNSLOTH_URL` | `http://127.0.0.1:8888` | Unsloth Studio endpoint |
+| `UNSLOTH_API_KEY` | — | `Authorization: Bearer` token for Unsloth Studio (required) |
+| `HF_HUB_CACHE` / `HF_HOME` | `~/.cache/huggingface/hub` | HF cache used for mlx / Unsloth (GGUF) metadata enrichment |
 | `XDG_CACHE_HOME` | `~/.cache` | cache location root |
+| `XDG_CONFIG_HOME` | `~/.config` | location of the optional `.env` (see below) |
 
 A bare host (no scheme) is accepted — `http://` is assumed.
+
+On startup `toks` reads `~/.config/toks/.env` (honoring `XDG_CONFIG_HOME`) for any
+of the variables above — handy for the `UNSLOTH_API_KEY`. It is **read-only**: a
+real environment variable always wins, and `toks` never writes the file. Lines are
+`KEY=VALUE` (blank lines and `#` comments ignored; a leading `export` and
+surrounding quotes are stripped).
 
 ## LM Studio prerequisites
 
@@ -78,6 +96,20 @@ best-effort backfill from the richer `/api/v1/models` (LM Studio 0.4.0+) and sho
    `toks` detects these locally and refuses to benchmark them.
 4. Models JIT-load on first request; the usual 1-token warmup absorbs the load time.
 
+## Unsloth Studio prerequisites
+
+1. Start Unsloth Studio (default port `8888`) and put its key in
+   `~/.config/toks/.env` as `UNSLOTH_API_KEY=…` (every API route is auth-gated).
+2. Its `/v1/models` listing carries only model ids, so `toks` enriches rows from
+   the local **HF cache** by parsing the model's main GGUF header — exact
+   parameter count (summed from the tensor table), quant (`general.file_type`),
+   context length, and MoE shape. This works only when `toks` runs on the
+   server's machine; for a remote `UNSLOTH_URL` those columns show `-` (but the
+   benchmark still works, since timings are server-side).
+3. A repo may ship extra GGUFs (`mmproj-*` vision projectors, an `mtp-*` draft
+   head); `toks` sizes and parses the main weights file, ignoring those.
+4. Models are usually already resident; the usual 1-token warmup absorbs any load.
+
 ## Behaviour with one backend down
 
 `toks` (provider `all`) lists whatever is reachable and prints a one-line note to
@@ -93,5 +125,6 @@ python3 -m unittest test_toks   # network-free unit tests
 
 ## Design
 
-See `docs/superpowers/specs/2026-05-31-toks-lmstudio-provider-design.md` and
-`docs/superpowers/specs/2026-06-06-mlx-provider-design.md`.
+See `docs/superpowers/specs/2026-05-31-toks-lmstudio-provider-design.md`,
+`docs/superpowers/specs/2026-06-06-mlx-provider-design.md`, and
+`docs/specs/2026-06-24-unsloth-studio-provider-and-bpw-design.md`.

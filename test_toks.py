@@ -7,7 +7,9 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import os
 import pathlib
+import struct
 import sys
 import tempfile
 import unittest
@@ -470,7 +472,7 @@ class MlxWiringTests(unittest.TestCase):
     def test_select_providers_all_includes_mlx(self):
         providers = toks.select_providers("all")
         self.assertEqual([p.name for p in providers],
-                         ["ollama", "lmstudio", "mlx"])
+                         ["ollama", "lmstudio", "mlx", "unsloth"])
 
     def test_provider_flag_accepts_mlx(self):
         self.assertEqual(toks.parse_args(["--provider", "mlx"]).provider, "mlx")
@@ -812,6 +814,339 @@ class MainDisplayTests(unittest.TestCase):
         output = self._run_main(["--bench", "fast-model"])
         self.assertIn("fast-model", output)
         self.assertNotIn("cold-model", output)
+
+
+# ---- bits/weight column ----------------------------------------------------
+
+
+class BpwTests(unittest.TestCase):
+    def test_effective_bpw_exact(self):
+        rec = toks.ModelRecord("unsloth", "m", size_bytes=18_323_731_456,
+                               param_count=30_697_345_596)
+        self.assertAlmostEqual(toks.effective_bpw(rec), 4.776, places=2)
+
+    def test_human_bpw_two_decimals(self):
+        rec = toks.ModelRecord("ollama", "m", size_bytes=20_230_000_000,
+                               param_count=31_273_088_876)
+        self.assertEqual(toks.human_bpw(rec), "5.18")
+
+    def test_human_bpw_tilde_when_estimated(self):
+        rec = toks.ModelRecord("mlx", "m", size_bytes=1_000_000_000,
+                               param_count=2_000_000_000, param_estimated=True)
+        self.assertEqual(toks.human_bpw(rec), "~4.00")
+
+    def test_dash_when_size_or_count_missing(self):
+        self.assertIsNone(toks.effective_bpw(toks.ModelRecord("ollama", "m")))
+        self.assertEqual(toks.human_bpw(toks.ModelRecord("ollama", "m")), "-")
+        self.assertEqual(
+            toks.human_bpw(toks.ModelRecord("ollama", "m", size_bytes=100)), "-")
+
+    def test_header_has_bpw_after_params(self):
+        self.assertEqual(toks.HEADER.index("BPW"), toks.HEADER.index("PARAMS") + 1)
+        self.assertIn("BPW", toks.RIGHT_ALIGN)
+
+    def test_row_renders_bpw_value(self):
+        rec = toks.ModelRecord("unsloth", "demo-GGUF", fmt="gguf", params="31B",
+                               size_bytes=18_323_731_456,
+                               param_count=30_697_345_596)
+        rows = toks.build_rows([rec], {})
+        cell = dict(zip(rows[0], rows[1]))
+        self.assertEqual(cell["BPW"], "4.78")
+
+    def test_row_bpw_dash_when_unknown(self):
+        rows = toks.build_rows([toks.ModelRecord("ollama", "x", params="8B")], {})
+        cell = dict(zip(rows[0], rows[1]))
+        self.assertEqual(cell["BPW"], "-")
+
+
+# ---- ollama param-count split ----------------------------------------------
+
+
+class OllamaParamCountTests(unittest.TestCase):
+    def test_real_count_kept(self):
+        model = {"size": 4_700_000_000,
+                 "details": {"quantization_level": "Q4_K_M"}}
+        info = {"general.parameter_count": 8_000_000_000}
+        total, estimated, _ec, _eu = toks.ollama_param_count(model, info)
+        self.assertEqual(total, 8_000_000_000)
+        self.assertFalse(estimated)
+
+    def test_bogus_count_replaced_by_size_estimate(self):
+        # parameter_count implies ~72 bits/weight at this size -> discard it.
+        model = {"size": 18_000_000_000,
+                 "details": {"quantization_level": "Q4_K_M"}}
+        info = {"general.parameter_count": 2_000_000_000}
+        total, estimated, _ec, _eu = toks.ollama_param_count(model, info)
+        self.assertTrue(estimated)
+        self.assertNotEqual(total, 2_000_000_000)
+
+    def test_parse_models_populates_param_fields(self):
+        tags = [{"name": "m:8b", "size": 4_700_000_000,
+                 "details": {"format": "gguf", "quantization_level": "Q4_K_M"}}]
+        info = {"m:8b": {"general.parameter_count": 8_000_000_000}}
+        rec = toks.ollama_parse_models(tags, info)[0]
+        self.assertEqual(rec.param_count, 8_000_000_000)
+        self.assertFalse(rec.param_estimated)
+        self.assertEqual(rec.params, "8B")
+
+
+# ---- GGUF header parsing ----------------------------------------------------
+
+
+def _gguf_str(value):
+    encoded = value.encode("utf-8")
+    return struct.pack("<Q", len(encoded)) + encoded
+
+
+def _build_gguf(arch="gemma4", file_type=15, ctx=4096, tensors=None,
+                expert_count=None, version=3):
+    """Synthesize a minimal valid GGUF blob (header only; no tensor data)."""
+    if tensors is None:
+        tensors = [("token_embd.weight", [256, 64]), ("blk.0.weight", [64, 64])]
+    kvs = [
+        ("general.architecture", 8, _gguf_str(arch)),
+        ("general.file_type", 5, struct.pack("<I", file_type)),
+        (f"{arch}.context_length", 5, struct.pack("<I", ctx)),
+    ]
+    if expert_count is not None:
+        kvs.append((f"{arch}.expert_count", 5, struct.pack("<I", expert_count)))
+        kvs.append((f"{arch}.expert_used_count", 5, struct.pack("<I", 2)))
+    blob = b"GGUF" + struct.pack("<I", version)
+    blob += struct.pack("<Q", len(tensors)) + struct.pack("<Q", len(kvs))
+    for key, vtype, vbytes in kvs:
+        blob += _gguf_str(key) + struct.pack("<I", vtype) + vbytes
+    for offset, (name, dims) in enumerate(tensors):
+        blob += _gguf_str(name) + struct.pack("<I", len(dims))
+        for dim in dims:
+            blob += struct.pack("<Q", dim)
+        blob += struct.pack("<I", 0) + struct.pack("<Q", offset)  # type, offset
+    return blob
+
+
+class GgufMetaTests(unittest.TestCase):
+    def _write(self, data):
+        tmp = tempfile.NamedTemporaryFile(suffix=".gguf", delete=False)
+        tmp.write(data)
+        tmp.close()
+        self.addCleanup(lambda: pathlib.Path(tmp.name).unlink(missing_ok=True))
+        return tmp.name
+
+    def test_exact_param_count_sums_tensor_dims(self):
+        meta = toks.read_gguf_meta(self._write(
+            _build_gguf(tensors=[("a", [256, 64]), ("b", [64, 64])])))
+        self.assertEqual(meta["param_count"], 256 * 64 + 64 * 64)
+
+    def test_quant_label_from_file_type(self):
+        meta = toks.read_gguf_meta(self._write(_build_gguf(file_type=15)))
+        self.assertEqual(meta["quant"], "Q4_K_M")
+
+    def test_context_length_from_arch_key(self):
+        meta = toks.read_gguf_meta(self._write(
+            _build_gguf(arch="gemma4", ctx=262144)))
+        self.assertEqual(meta["ctx"], 262144)
+
+    def test_moe_expert_counts(self):
+        meta = toks.read_gguf_meta(self._write(_build_gguf(expert_count=8)))
+        self.assertEqual(meta["expert_count"], 8)
+        self.assertEqual(meta["expert_used"], 2)
+
+    def test_unknown_file_type_falls_back_to_label(self):
+        meta = toks.read_gguf_meta(self._write(_build_gguf(file_type=999)))
+        self.assertEqual(meta["quant"], "ftype999")
+
+    def test_garbage_returns_none(self):
+        self.assertIsNone(toks.read_gguf_meta(self._write(b"NOTGGUF-bytes")))
+
+    def test_missing_file_returns_none(self):
+        self.assertIsNone(toks.read_gguf_meta("/nonexistent/file.gguf"))
+
+
+class SelectMainGgufTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.snap = pathlib.Path(tmp.name)
+
+    def _f(self, name, size):
+        (self.snap / name).write_bytes(b"x" * size)
+
+    def test_picks_largest_non_projector(self):
+        self._f("model-Q4_K_M.gguf", 5000)
+        self._f("mmproj-F16.gguf", 9000)     # projector, ignored
+        self._f("mtp-model.gguf", 8000)      # draft head, ignored
+        self._f("model-Q2_K.gguf", 1000)
+        self.assertEqual(toks.select_main_gguf(self.snap).name, "model-Q4_K_M.gguf")
+
+    def test_none_when_only_projectors(self):
+        self._f("mmproj-F16.gguf", 9000)
+        self.assertIsNone(toks.select_main_gguf(self.snap))
+
+    def test_none_when_empty(self):
+        self.assertIsNone(toks.select_main_gguf(self.snap))
+
+
+# ---- Unsloth Studio listing / enrich / benchmark / wiring -------------------
+
+
+UNSLOTH_MODELS = {"object": "list",
+                  "data": [{"id": "unsloth-org/demo-31B-it-GGUF",
+                            "object": "model"}]}
+
+
+def _make_gguf_repo(hub, repo_dir, gguf_bytes, extra=None):
+    repo = hub / repo_dir
+    (repo / "refs").mkdir(parents=True)
+    snapshot = repo / "snapshots" / "abc123"
+    snapshot.mkdir(parents=True)
+    (repo / "refs" / "main").write_text("abc123")
+    (snapshot / "model-Q4_K_M.gguf").write_bytes(gguf_bytes)
+    for name, data in (extra or {}).items():
+        (snapshot / name).write_bytes(data)
+    return snapshot
+
+
+class UnslothParseEnrichTests(unittest.TestCase):
+    def test_parse_ids_only(self):
+        recs = toks.unsloth_parse_models(UNSLOTH_MODELS)
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0].provider, "unsloth")
+        self.assertTrue(recs[0].benchmarkable)
+
+    def test_parse_empty_payload(self):
+        self.assertEqual(toks.unsloth_parse_models({}), [])
+
+    def test_enrich_from_cached_gguf(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        hub = pathlib.Path(tmp.name)
+        gguf = _build_gguf(arch="gemma4", file_type=15, ctx=262144,
+                           tensors=[("tok", [1000, 64]), ("out", [64, 1000])])
+        _make_gguf_repo(hub, "models--unsloth-org--demo-31B-it-GGUF", gguf,
+                        extra={"mmproj-F16.gguf": b"z" * 50})
+        recs = toks.unsloth_parse_models(UNSLOTH_MODELS)
+        toks.unsloth_enrich(recs, hub)
+        rec = recs[0]
+        self.assertEqual(rec.fmt, "gguf")
+        self.assertEqual(rec.quant, "Q4_K_M")
+        self.assertEqual(rec.ctx_max, 262144)
+        self.assertEqual(rec.param_count, 1000 * 64 + 64 * 1000)
+        self.assertFalse(rec.param_estimated)
+        self.assertEqual(rec.size_bytes, len(gguf))   # main file, not mmproj
+        self.assertIsNotNone(rec.modified_at)
+
+    def test_enrich_unknown_repo_is_noop(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        recs = toks.unsloth_parse_models(UNSLOTH_MODELS)
+        toks.unsloth_enrich(recs, pathlib.Path(tmp.name))   # must not raise
+        self.assertIsNone(recs[0].size_bytes)
+
+
+class LlamaCppTimingsTests(unittest.TestCase):
+    def test_reads_predicted_per_second_and_ttft(self):
+        result = toks.parse_llamacpp_timings(
+            {"timings": {"predicted_per_second": 39.6, "prompt_ms": 540.0}})
+        self.assertAlmostEqual(result.tokens_per_second, 39.6)
+        self.assertAlmostEqual(result.time_to_first_token, 0.54)
+
+    def test_missing_timings_returns_none(self):
+        self.assertIsNone(toks.parse_llamacpp_timings({}))
+        self.assertIsNone(toks.parse_llamacpp_timings({"timings": {}}))
+
+    def test_zero_tps_returns_none(self):
+        self.assertIsNone(toks.parse_llamacpp_timings(
+            {"timings": {"predicted_per_second": 0}}))
+
+    def test_no_prompt_ms_leaves_ttft_none(self):
+        result = toks.parse_llamacpp_timings(
+            {"timings": {"predicted_per_second": 10}})
+        self.assertEqual(result.tokens_per_second, 10)
+        self.assertIsNone(result.time_to_first_token)
+
+
+class BenchUnslothSseTests(unittest.TestCase):
+    CHUNKS = [
+        {"choices": [{"index": 0, "text": "Hello"}]},
+        {"choices": [{"index": 0, "text": " world"}]},
+    ]
+
+    def test_prefers_server_timings(self):
+        final = {"choices": [{"index": 0, "text": "", "finish_reason": "length"}],
+                 "usage": {"completion_tokens": 50},
+                 "timings": {"predicted_per_second": 42.0, "prompt_ms": 200.0}}
+        lines = _sse(*self.CHUNKS, final)
+        result = toks.bench_unsloth_sse(lines, start=0.0,
+                                        clock=FakeClock([1.0, 2.0]))
+        self.assertAlmostEqual(result.tokens_per_second, 42.0)
+        self.assertAlmostEqual(result.time_to_first_token, 0.2)
+
+    def test_falls_back_to_client_timing(self):
+        usage = {"choices": [], "usage": {"completion_tokens": 12}}
+        lines = _sse(*self.CHUNKS, usage)
+        result = toks.bench_unsloth_sse(lines, start=0.5,
+                                        clock=FakeClock([1.0, 3.0]))
+        self.assertAlmostEqual(result.tokens_per_second, 5.5)   # (12-1)/2.0
+        self.assertAlmostEqual(result.time_to_first_token, 0.5)
+
+
+class UnslothWiringTests(unittest.TestCase):
+    def test_select_providers_unsloth(self):
+        self.assertEqual([p.name for p in toks.select_providers("unsloth")],
+                         ["unsloth"])
+
+    def test_provider_flag_accepts_unsloth(self):
+        self.assertEqual(toks.parse_args(["--provider", "unsloth"]).provider,
+                         "unsloth")
+
+    def test_default_url_and_cache_prefix(self):
+        self.assertIn("unsloth:", toks._PROVIDER_PREFIXES)
+        with mock.patch.dict(toks.os.environ, {}, clear=True):
+            self.assertEqual(toks.unsloth_url(), "http://127.0.0.1:8888")
+
+    def test_headers_from_api_key(self):
+        with mock.patch.dict(toks.os.environ, {"UNSLOTH_API_KEY": "sk-zzz"},
+                             clear=True):
+            self.assertEqual(toks.unsloth_headers(),
+                             {"Authorization": "Bearer sk-zzz"})
+        with mock.patch.dict(toks.os.environ, {}, clear=True):
+            self.assertEqual(toks.unsloth_headers(), {})
+
+
+# ---- .env loader (read-only) -----------------------------------------------
+
+
+class LoadDotenvTests(unittest.TestCase):
+    def _write_env(self, text):
+        tmp = tempfile.NamedTemporaryFile("w", suffix=".env", delete=False)
+        tmp.write(text)
+        tmp.close()
+        self.addCleanup(lambda: pathlib.Path(tmp.name).unlink(missing_ok=True))
+        return tmp.name
+
+    def test_sets_keys_stripping_quotes_comments_export(self):
+        path = self._write_env(
+            "# a comment\n"
+            "\n"
+            "UNSLOTH_API_KEY=sk-test-123\n"
+            'export UNSLOTH_URL="http://127.0.0.1:8888"\n'
+            "QUOTED='single'\n")
+        with mock.patch.dict(toks.os.environ, {}, clear=True):
+            toks.load_dotenv(path)
+            self.assertEqual(toks.os.environ["UNSLOTH_API_KEY"], "sk-test-123")
+            self.assertEqual(toks.os.environ["UNSLOTH_URL"], "http://127.0.0.1:8888")
+            self.assertEqual(toks.os.environ["QUOTED"], "single")
+
+    def test_real_env_var_wins(self):
+        path = self._write_env("UNSLOTH_API_KEY=from-file\n")
+        with mock.patch.dict(toks.os.environ, {"UNSLOTH_API_KEY": "from-env"},
+                             clear=True):
+            toks.load_dotenv(path)
+            self.assertEqual(toks.os.environ["UNSLOTH_API_KEY"], "from-env")
+
+    def test_missing_file_is_noop(self):
+        with mock.patch.dict(toks.os.environ, {}, clear=True):
+            toks.load_dotenv("/nonexistent/dir/.env")   # must not raise
+            self.assertNotIn("UNSLOTH_API_KEY", toks.os.environ)
 
 
 if __name__ == "__main__":
