@@ -646,8 +646,11 @@ class BuildRowsTests(unittest.TestCase):
     def test_table_renders_aligned_string(self):
         rows = toks.build_rows(self.records, self.cache)
         out = toks.table(rows)
-        self.assertIn("PROVIDER", out.splitlines()[0])
-        self.assertEqual(len(out.splitlines()), 3)
+        lines = out.splitlines()
+        self.assertIn("PROVIDER", lines[0])
+        self.assertIn(" │ ", lines[0])               # column separators
+        self.assertEqual(set(lines[1]), {"─", "┼"})   # header/body rule
+        self.assertEqual(len(lines), 4)               # header + rule + 2 rows
 
 
 # ---- CLI parsing + benchmark target selection ------------------------------
@@ -785,8 +788,10 @@ class MainDisplayTests(unittest.TestCase):
         # Records default to benchmarkable=False, so run_benchmarks skips them;
         # active only needs to be non-empty to clear the reachability guard.
         active = {"ollama": object(), "lmstudio": object()}
+        statuses = [("ollama", True), ("lmstudio", True)]
         out = io.StringIO()
-        with mock.patch.object(toks, "gather_records", return_value=(records, active)), \
+        with mock.patch.object(toks, "gather_records",
+                               return_value=(records, active, statuses)), \
                 mock.patch.object(toks, "load_cache", return_value=cache), \
                 mock.patch.object(toks, "save_cache"), \
                 mock.patch.object(sys, "argv", ["toks", *argv]), \
@@ -814,6 +819,63 @@ class MainDisplayTests(unittest.TestCase):
         output = self._run_main(["--bench", "fast-model"])
         self.assertIn("fast-model", output)
         self.assertNotIn("cold-model", output)
+
+
+# ---- provider reachability summary -----------------------------------------
+
+
+class _StubProvider:
+    def __init__(self, name, records=None, fail=False):
+        self.name = name
+        self._records = records or []
+        self._fail = fail
+
+    def list_models(self):
+        if self._fail:
+            raise RuntimeError("could not reach http://localhost:8080/v1/models")
+        return self._records
+
+
+class GatherRecordsTests(unittest.TestCase):
+    def test_reachable_and_failed_providers_reported_in_order(self):
+        rec = toks.ModelRecord("ollama", "m")
+        providers = [
+            _StubProvider("ollama", records=[rec]),
+            _StubProvider("mlx", fail=True),
+        ]
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            records, active, statuses = toks.gather_records(providers)
+        self.assertEqual(records, [rec])
+        self.assertEqual(list(active), ["ollama"])
+        self.assertEqual(statuses, [("ollama", True), ("mlx", False)])
+
+    def test_failure_does_not_print_the_long_warning(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            toks.gather_records([_StubProvider("mlx", fail=True)])
+        self.assertEqual(err.getvalue(), "")
+
+
+class ProviderStatusLineTests(unittest.TestCase):
+    def test_plain_line_marks_reachable_and_unreachable(self):
+        line = toks.provider_status_line(
+            [("ollama", True), ("mlx", False)], color=False)
+        self.assertEqual(line, "ollama ✓  mlx ✗")
+        self.assertNotIn("\x1b", line)
+
+    def test_single_line_for_all_providers(self):
+        statuses = [("ollama", True), ("lmstudio", False),
+                    ("mlx", False), ("unsloth", True)]
+        line = toks.provider_status_line(statuses, color=False)
+        self.assertNotIn("\n", line)
+
+    def test_color_wraps_marks_only(self):
+        line = toks.provider_status_line(
+            [("ollama", True), ("mlx", False)], color=True)
+        self.assertIn(f"\x1b[{toks.STATUS_OK}m✓\x1b[0m", line)
+        self.assertIn(f"\x1b[{toks.STATUS_BAD}m✗\x1b[0m", line)
+        self.assertTrue(line.startswith("ollama "))   # names stay uncoloured
 
 
 # ---- bits/weight column ----------------------------------------------------

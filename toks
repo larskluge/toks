@@ -946,6 +946,29 @@ def build_rows(records, cache):
     return rows
 
 
+# Softer than the default ANSI red/green so the status line reads as an accent,
+# not an alarm: a spring green and a muted indianred from the 256-colour palette.
+STATUS_OK = "38;5;78"
+STATUS_BAD = "38;5;167"
+
+
+def _color(text, code, enabled):
+    return f"\x1b[{code}m{text}\x1b[0m" if enabled else text
+
+
+def provider_status_line(statuses, color=True):
+    """One-line summary of which providers answered the listing request.
+
+    Each entry is `name ✓` (reachable) or `name ✗` (unreachable); the mark is
+    coloured when `color` is set.
+    """
+    parts = []
+    for name, ok in statuses:
+        mark = _color("✓", STATUS_OK, color) if ok else _color("✗", STATUS_BAD, color)
+        parts.append(f"{name} {mark}")
+    return "  ".join(parts)
+
+
 def table(rows):
     col_count = len(rows[0]) if rows else 0
     widths = [0] * col_count
@@ -954,14 +977,16 @@ def table(rows):
             widths[index] = max(widths[index], len(cell))
     header = rows[0] if rows else []
     lines = []
-    for row in rows:
+    for r_index, row in enumerate(rows):
         cells = []
         for index, cell in enumerate(row):
             if header[index] in RIGHT_ALIGN:
                 cells.append(cell.rjust(widths[index]))
             else:
                 cells.append(cell.ljust(widths[index]))
-        lines.append("  ".join(cells))
+        lines.append(" │ ".join(cells))
+        if r_index == 0 and len(rows) > 1:
+            lines.append("─┼─".join("─" * widths[index] for index in range(col_count)))
     return "\n".join(lines)
 
 
@@ -1278,18 +1303,24 @@ def select_providers(choice):
 
 
 def gather_records(providers):
-    """List models from every reachable provider; isolate per-provider failures."""
+    """List models from every reachable provider; isolate per-provider failures.
+
+    Returns (records, active, statuses) where statuses is a list of
+    (provider_name, reachable) pairs in query order, for a one-line summary.
+    """
     records = []
     active = {}
+    statuses = []
     for provider in providers:
         try:
             recs = provider.list_models()
-        except RuntimeError as exc:
-            print(f"note: skipping {provider.name}: {exc}", file=sys.stderr)
+        except RuntimeError:
+            statuses.append((provider.name, False))
             continue
         records.extend(recs)
         active[provider.name] = provider
-    return records, active
+        statuses.append((provider.name, True))
+    return records, active, statuses
 
 
 # --- cache persistence (I/O) ------------------------------------------------
@@ -1414,7 +1445,10 @@ def main():
     args = parse_args()
     load_dotenv()   # read-only: ~/.config/toks/.env, real env vars win
 
-    records, active = gather_records(select_providers(args.provider))
+    records, active, statuses = gather_records(select_providers(args.provider))
+    if statuses:
+        use_color = sys.stderr.isatty() and not os.environ.get("NO_COLOR")
+        print(provider_status_line(statuses, color=use_color), file=sys.stderr)
     if not active:
         raise RuntimeError("no model providers reachable")
 

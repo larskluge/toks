@@ -7,10 +7,16 @@ standard library only.
 
 ```
 $ toks
-PROVIDER  NAME                            SIZE  TAG   PARAMS   BPW   CTX  TTFT  TOKENS/S  MODIFIED
-unsloth   unsloth/gemma-4-31B-it-GGUF  17.1 GB  gguf     31B  4.78  256k  0.10      39.6  2 hours ago
-ollama    gemma4:31b-mlx               18.8 GB  mlx      31B  5.18  256k  0.37      25.0  3 weeks ago
+ollama ✓  lmstudio ✓  mlx ✗  unsloth ✓
+PROVIDER │ NAME                        │    SIZE │ TAG  │ PARAMS │  BPW │  CTX │ TTFT │ TOKENS/S │ MODIFIED
+─────────┼─────────────────────────────┼─────────┼──────┼────────┼──────┼──────┼──────┼──────────┼────────────
+unsloth  │ unsloth/gemma-4-31B-it-GGUF │ 17.1 GB │ gguf │    31B │ 4.78 │ 256k │ 0.10 │     39.6 │ 2 hours ago
+ollama   │ gemma4:31b-mlx              │ 18.8 GB │ mlx  │    31B │ 5.18 │ 256k │ 0.37 │     25.0 │ 3 weeks ago
 ```
+
+The first line is a one-line reachability summary printed to stderr — a green ✓
+for each backend that answered the listing request and a red ✗ for one that
+didn't (here mlx-lm is down).
 
 The **`BPW`** column is on-disk bits ÷ parameter count — the *effective* width,
 which can differ sharply from the quant's nominal one. Above, two 31B Gemma-4
@@ -112,10 +118,11 @@ best-effort backfill from the richer `/api/v1/models` (LM Studio 0.4.0+) and sho
 
 ## Behaviour with one backend down
 
-`toks` (provider `all`) lists whatever is reachable and prints a one-line note to
-stderr for any configured-but-unreachable backend. It only errors if **no** backend
-is reachable. So with LM Studio and mlx-lm off, it behaves exactly like the
-original Ollama-only tool.
+`toks` (provider `all`) lists whatever is reachable and prints a single
+reachability line to stderr — each backend with a green ✓ (answered) or red ✗
+(unreachable), no error detail. Colour is emitted only when stderr is a TTY and
+`NO_COLOR` is unset. It only errors if **no** backend is reachable. So with LM
+Studio and mlx-lm off, it behaves exactly like the original Ollama-only tool.
 
 ## Tests
 
