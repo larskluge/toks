@@ -54,6 +54,15 @@ over a network, latency leaks into the numbers. Unsloth Studio is a llama.cpp
 server, so `toks` reads its server-measured `timings` (`predicted_per_second`,
 `prompt_ms`) from the stream — accurate even over a network.
 
+Each cached benchmark records the **observed backend** — the engine inferred from
+the response shape (Ollama counters, LM Studio `stats`, llama.cpp `timings`, or a
+client-timed mlx_lm stream) plus the server's `system_fingerprint` and the endpoint
+actually hit — alongside the configured provider label. Because default ports get
+reused (mlx-lm's `:8080` especially), this is what stops a different server that
+later binds the port from being silently recorded under the wrong label: if the
+observed engine isn't the one the port should host, `toks` warns and stores the
+truth, so cross-runtime comparisons stay honest.
+
 ## Configuration
 
 | Variable | Default | Notes |
@@ -106,15 +115,24 @@ best-effort backfill from the richer `/api/v1/models` (LM Studio 0.4.0+) and sho
 
 1. Start Unsloth Studio (default port `8888`) and put its key in
    `~/.config/toks/.env` as `UNSLOTH_API_KEY=…` (every API route is auth-gated).
-2. Its `/v1/models` listing carries only model ids, so `toks` enriches rows from
-   the local **HF cache** by parsing the model's main GGUF header — exact
-   parameter count (summed from the tensor table), quant (`general.file_type`),
-   context length, and MoE shape. This works only when `toks` runs on the
-   server's machine; for a remote `UNSLOTH_URL` those columns show `-` (but the
-   benchmark still works, since timings are server-side).
-3. A repo may ship extra GGUFs (`mmproj-*` vision projectors, an `mtp-*` draft
+2. Listing uses `GET /api/hub/local` (Studio's downloaded-model inventory), **not**
+   `/v1/models` — the latter reports only the model currently *loaded* for serving,
+   so it is empty whenever nothing is loaded. `toks` keeps the HF-cache,
+   text-generation entries (dropping image/embedding/speech repos and the LM
+   Studio / Ollama models that toks' own providers already list). The listing is
+   format-agnostic: GGUF **and** MLX/safetensors Unsloth weights both appear.
+3. The list is **not** scoped to `unsloth/*`. An `mlx-community/*` chat model that
+   also sits in the HF cache is listed under `unsloth` on purpose, so Studio's
+   throughput for the exact same files can be compared against the `mlx` provider's
+   number for them.
+4. Rows are enriched from the local **HF cache** by parsing the model's main GGUF
+   header — exact parameter count (summed from the tensor table), quant
+   (`general.file_type`), context length, MoE shape. This works only when `toks`
+   runs on the server's machine; for a remote `UNSLOTH_URL`, and for MLX/safetensors
+   models (no GGUF header), those columns show `-` (the benchmark still works).
+5. A repo may ship extra GGUFs (`mmproj-*` vision projectors, an `mtp-*` draft
    head); `toks` sizes and parses the main weights file, ignoring those.
-4. Models are usually already resident; the usual 1-token warmup absorbs any load.
+6. Models are usually already resident; the usual 1-token warmup absorbs any load.
 
 ## Behaviour with one backend down
 
@@ -133,5 +151,6 @@ python3 -m unittest test_toks   # network-free unit tests
 ## Design
 
 See `docs/superpowers/specs/2026-05-31-toks-lmstudio-provider-design.md`,
-`docs/superpowers/specs/2026-06-06-mlx-provider-design.md`, and
-`docs/specs/2026-06-24-unsloth-studio-provider-and-bpw-design.md`.
+`docs/superpowers/specs/2026-06-06-mlx-provider-design.md`,
+`docs/specs/2026-06-24-unsloth-studio-provider-and-bpw-design.md`, and
+`docs/specs/2026-06-25-unsloth-local-listing-and-bench-backend-identity-design.md`.

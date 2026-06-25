@@ -1050,9 +1050,39 @@ class SelectMainGgufTests(unittest.TestCase):
 # ---- Unsloth Studio listing / enrich / benchmark / wiring -------------------
 
 
-UNSLOTH_MODELS = {"object": "list",
-                  "data": [{"id": "unsloth-org/demo-31B-it-GGUF",
-                            "object": "model"}]}
+# Anonymized capture of GET /api/hub/local: HF-cache, LM Studio, and Ollama
+# entries carrying Studio's (deliberately imperfect) capability flags.
+HUB_LOCAL = {"models": [
+    {"id": "acme/demo-31B-it-GGUF", "source": "hf_cache",
+     "model_format": "gguf", "runtime": "llama_cpp",
+     "size_bytes": 18_000_000_000, "capabilities": {"can_chat": True}},
+    {"id": "mlx-folk/demo-coder-8bit", "source": "hf_cache",
+     "model_format": "safetensors", "runtime": "transformers",
+     "size_bytes": 8_000_000_000, "capabilities": {"can_chat": True}},
+    {"id": "acme/bge-small-en-GGUF", "source": "hf_cache",          # embedding...
+     "model_format": "gguf", "runtime": "llama_cpp",
+     "capabilities": {"can_chat": True}},                          # ...mislabeled
+    {"id": "voicelab/tts-1.6b", "source": "hf_cache",              # speech...
+     "model_format": "safetensors", "runtime": "transformers",
+     "capabilities": {"can_chat": True}},                          # ...mislabeled
+    {"id": "imagelab/Z-Image-Turbo", "source": "hf_cache",         # image gen
+     "model_format": "safetensors", "runtime": "transformers",
+     "capabilities": {"can_chat": False}},
+    {"id": "ggml-folk/models", "source": "hf_cache",               # partial junk
+     "model_format": "unknown", "runtime": "unknown",
+     "capabilities": {"can_chat": False}},
+    {"id": "/home/u/.lmstudio/models/acme/demo-35B", "source": "lmstudio",
+     "model_format": "gguf", "runtime": "llama_cpp",
+     "capabilities": {"can_chat": True}},                          # LM Studio's own
+    {"id": "ollama-manifest:%2Fhome%2Fu%2F.ollama%2Fmodels%2Fdemo",
+     "source": "ollama", "model_format": "gguf", "runtime": "llama_cpp",
+     "capabilities": {"can_chat": True}},                          # Ollama's own
+]}
+
+# Single hf_cache entry whose id maps to the cached repo dir built in tests.
+ENRICH_LOCAL = {"models": [{"id": "acme/demo-31B-it-GGUF", "source": "hf_cache",
+                            "model_format": "gguf", "runtime": "llama_cpp",
+                            "capabilities": {"can_chat": True}}]}
 
 
 def _make_gguf_repo(hub, repo_dir, gguf_bytes, extra=None):
@@ -1067,15 +1097,38 @@ def _make_gguf_repo(hub, repo_dir, gguf_bytes, extra=None):
     return snapshot
 
 
-class UnslothParseEnrichTests(unittest.TestCase):
-    def test_parse_ids_only(self):
-        recs = toks.unsloth_parse_models(UNSLOTH_MODELS)
-        self.assertEqual(len(recs), 1)
-        self.assertEqual(recs[0].provider, "unsloth")
-        self.assertTrue(recs[0].benchmarkable)
+class UnslothParseLocalTests(unittest.TestCase):
+    def test_keeps_hf_cache_text_models(self):
+        recs = toks.unsloth_parse_local(HUB_LOCAL)
+        self.assertEqual({r.name for r in recs},
+                         {"acme/demo-31B-it-GGUF", "mlx-folk/demo-coder-8bit"})
+        self.assertTrue(all(r.provider == "unsloth" and r.benchmarkable
+                            for r in recs))
 
-    def test_parse_empty_payload(self):
-        self.assertEqual(toks.unsloth_parse_models({}), [])
+    def test_drops_other_sources(self):
+        names = {r.name for r in toks.unsloth_parse_local(HUB_LOCAL)}
+        self.assertNotIn("/home/u/.lmstudio/models/acme/demo-35B", names)
+        self.assertFalse(any("ollama-manifest" in n for n in names))
+
+    def test_drops_nonchat_and_unknown_format(self):
+        names = {r.name for r in toks.unsloth_parse_local(HUB_LOCAL)}
+        self.assertNotIn("imagelab/Z-Image-Turbo", names)   # can_chat False
+        self.assertNotIn("ggml-folk/models", names)         # unknown format
+
+    def test_drops_embedding_and_speech_despite_can_chat(self):
+        names = {r.name for r in toks.unsloth_parse_local(HUB_LOCAL)}
+        self.assertNotIn("acme/bge-small-en-GGUF", names)
+        self.assertNotIn("voicelab/tts-1.6b", names)
+
+    def test_keeps_non_unsloth_namespace_overlap(self):
+        # An mlx-community-style repo is listed under unsloth on purpose, so its
+        # Studio throughput can be compared against the mlx provider's number.
+        names = {r.name for r in toks.unsloth_parse_local(HUB_LOCAL)}
+        self.assertIn("mlx-folk/demo-coder-8bit", names)
+
+    def test_empty_or_malformed(self):
+        self.assertEqual(toks.unsloth_parse_local({}), [])
+        self.assertEqual(toks.unsloth_parse_local({"models": "nope"}), [])
 
     def test_enrich_from_cached_gguf(self):
         tmp = tempfile.TemporaryDirectory()
@@ -1083,9 +1136,9 @@ class UnslothParseEnrichTests(unittest.TestCase):
         hub = pathlib.Path(tmp.name)
         gguf = _build_gguf(arch="gemma4", file_type=15, ctx=262144,
                            tensors=[("tok", [1000, 64]), ("out", [64, 1000])])
-        _make_gguf_repo(hub, "models--unsloth-org--demo-31B-it-GGUF", gguf,
+        _make_gguf_repo(hub, "models--acme--demo-31B-it-GGUF", gguf,
                         extra={"mmproj-F16.gguf": b"z" * 50})
-        recs = toks.unsloth_parse_models(UNSLOTH_MODELS)
+        recs = toks.unsloth_parse_local(ENRICH_LOCAL)
         toks.unsloth_enrich(recs, hub)
         rec = recs[0]
         self.assertEqual(rec.fmt, "gguf")
@@ -1099,9 +1152,43 @@ class UnslothParseEnrichTests(unittest.TestCase):
     def test_enrich_unknown_repo_is_noop(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
-        recs = toks.unsloth_parse_models(UNSLOTH_MODELS)
+        recs = toks.unsloth_parse_local(ENRICH_LOCAL)
         toks.unsloth_enrich(recs, pathlib.Path(tmp.name))   # must not raise
         self.assertIsNone(recs[0].size_bytes)
+
+    def test_enrich_mlx_safetensors_fallback(self):
+        # An mlx-community-style repo (no GGUF) enriches from config.json so its
+        # cross-runtime-comparison row isn't all dashes.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        hub = pathlib.Path(tmp.name)
+        config = {"model_type": "qwen3", "architectures": ["Qwen3ForCausalLM"],
+                  "max_position_embeddings": 262144,
+                  "quantization": {"group_size": 64, "bits": 8}}
+        _make_hub_repo(hub, "models--mlx-folk--demo-coder-8bit", config)
+        local = {"models": [{"id": "mlx-folk/demo-coder-8bit", "source": "hf_cache",
+                             "model_format": "safetensors", "runtime": "transformers",
+                             "capabilities": {"can_chat": True}}]}
+        recs = toks.unsloth_parse_local(local)
+        toks.unsloth_enrich(recs, hub)
+        rec = recs[0]
+        self.assertEqual(rec.fmt, "safetensors")
+        self.assertEqual(rec.quant, "8bit")
+        self.assertEqual(rec.ctx_max, 262144)
+        self.assertTrue(rec.param_estimated)          # size-derived, not exact
+        self.assertTrue(rec.params.startswith("~"))
+        self.assertIsNotNone(rec.size_bytes)
+        self.assertIsNotNone(rec.modified_at)
+
+
+class UnslothListModelsTests(unittest.TestCase):
+    def test_queries_hub_local(self):
+        provider = toks.UnslothProvider()
+        with mock.patch.object(toks, "http_json", return_value=ENRICH_LOCAL) as hj, \
+                mock.patch.object(toks, "is_local_host", return_value=False):
+            recs = provider.list_models()
+        self.assertEqual([r.name for r in recs], ["acme/demo-31B-it-GGUF"])
+        self.assertTrue(hj.call_args[0][0].endswith("/api/hub/local"))
 
 
 class LlamaCppTimingsTests(unittest.TestCase):
@@ -1149,6 +1236,112 @@ class BenchUnslothSseTests(unittest.TestCase):
                                         clock=FakeClock([1.0, 3.0]))
         self.assertAlmostEqual(result.tokens_per_second, 5.5)   # (12-1)/2.0
         self.assertAlmostEqual(result.time_to_first_token, 0.5)
+
+
+class ObservedBackendTests(unittest.TestCase):
+    """Each bench path records which engine actually answered."""
+
+    def test_fingerprint_classifier(self):
+        self.assertTrue(toks._looks_llamacpp_fingerprint("b9773-abc123"))
+        self.assertFalse(toks._looks_llamacpp_fingerprint("fp_44709c"))
+        self.assertFalse(toks._looks_llamacpp_fingerprint(None))
+
+    def test_ollama_parser_stamps_backend(self):
+        r = toks.parse_ollama_bench({"eval_count": 10, "eval_duration": 1_000_000_000})
+        self.assertEqual((r.tps_source, r.observed_backend), ("ollama", "ollama"))
+
+    def test_lmstudio_parser_stamps_backend_and_fingerprint(self):
+        r = toks.parse_lmstudio_bench({"stats": {"tokens_per_second": 20.0},
+                                       "system_fingerprint": "lmstudio-fp"})
+        self.assertEqual((r.tps_source, r.observed_backend),
+                         ("lmstudio_stats", "lmstudio"))
+        self.assertEqual(r.system_fingerprint, "lmstudio-fp")
+
+    def test_llamacpp_timings_stamps_backend_and_fingerprint(self):
+        r = toks.parse_llamacpp_timings({"timings": {"predicted_per_second": 30.0},
+                                         "system_fingerprint": "b9773-deadbeef"})
+        self.assertEqual((r.tps_source, r.observed_backend),
+                         ("llamacpp_timings", "llamacpp"))
+        self.assertEqual(r.system_fingerprint, "b9773-deadbeef")
+
+    def test_mlx_stream_is_mlx_lm(self):
+        lines = _sse({"choices": [{"text": "a"}]}, {"choices": [{"text": "b"}]},
+                     {"choices": [], "usage": {"completion_tokens": 6}})
+        r = toks.bench_from_sse(lines, start=0.0, clock=FakeClock([1.0, 2.0]))
+        self.assertEqual(r.observed_backend, "mlx_lm")
+        self.assertEqual(r.tps_source, "client_timed")
+
+    def test_mlx_port_serving_llamacpp_flagged_by_timings(self):
+        # A llama.cpp server squatting on the mlx port leaks a timings block.
+        lines = _sse({"choices": [{"text": "a"}]},
+                     {"choices": [{"text": "b"}],
+                      "timings": {"predicted_per_second": 9}},
+                     {"choices": [], "usage": {"completion_tokens": 6}})
+        r = toks.bench_from_sse(lines, start=0.0, clock=FakeClock([1.0, 2.0]))
+        self.assertEqual(r.observed_backend, "llamacpp")
+
+    def test_mlx_port_serving_llamacpp_flagged_by_fingerprint(self):
+        lines = _sse({"choices": [{"text": "a"}], "system_fingerprint": "b9773-x"},
+                     {"choices": [{"text": "b"}]},
+                     {"choices": [], "usage": {"completion_tokens": 6}})
+        r = toks.bench_from_sse(lines, start=0.0, clock=FakeClock([1.0, 2.0]))
+        self.assertEqual(r.observed_backend, "llamacpp")
+
+    def test_unsloth_fallback_backend_is_unknown(self):
+        # No llama.cpp timings: Studio served via another runtime (transformers).
+        lines = _sse({"choices": [{"text": "a"}]}, {"choices": [{"text": "b"}]},
+                     {"choices": [], "usage": {"completion_tokens": 6}})
+        r = toks.bench_unsloth_sse(lines, start=0.0, clock=FakeClock([1.0, 2.0]))
+        self.assertEqual((r.tps_source, r.observed_backend),
+                         ("client_timed", "unknown"))
+
+
+class BenchIdentityPersistenceTests(unittest.TestCase):
+    class StubProvider:
+        def __init__(self, host, expected, result):
+            self.host = host
+            self.expected_backend = expected
+            self._result = result
+
+        def benchmark(self, rec, prompt, max_tokens):
+            return self._result
+
+    def _bench(self, provider_name, provider):
+        rec = toks.ModelRecord(provider_name, "demo-model", benchmarkable=True)
+        cache = {}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            toks.run_benchmarks([rec], {provider_name: provider}, cache)
+        return cache[toks.cache_key(rec)], err.getvalue()
+
+    def test_records_observed_backend_and_endpoint(self):
+        result = toks.BenchResult(50.0, 0.2, tps_source="client_timed",
+                                  observed_backend="mlx_lm")
+        entry, err = self._bench(
+            "mlx", self.StubProvider("http://localhost:8080", "mlx_lm", result))
+        self.assertEqual(entry["endpoint"], "http://localhost:8080")
+        self.assertEqual(entry["observed_backend"], "mlx_lm")
+        self.assertEqual(entry["tps_source"], "client_timed")
+        self.assertNotIn("warning", err)
+
+    def test_warns_when_observed_differs_from_expected(self):
+        result = toks.BenchResult(50.0, 0.2, tps_source="client_timed",
+                                  observed_backend="llamacpp",
+                                  system_fingerprint="b9773-x")
+        entry, err = self._bench(
+            "mlx", self.StubProvider("http://localhost:8080", "mlx_lm", result))
+        self.assertEqual(entry["observed_backend"], "llamacpp")
+        self.assertIn("expected mlx_lm", err)
+        self.assertIn("observed llamacpp", err)
+        self.assertIn("b9773-x", err)
+
+    def test_no_warning_when_provider_expects_none(self):
+        result = toks.BenchResult(50.0, 0.2, tps_source="client_timed",
+                                  observed_backend="unknown")
+        entry, err = self._bench(
+            "unsloth", self.StubProvider("http://127.0.0.1:8888", None, result))
+        self.assertEqual(entry["observed_backend"], "unknown")
+        self.assertNotIn("warning", err)
 
 
 class UnslothWiringTests(unittest.TestCase):

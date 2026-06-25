@@ -6,6 +6,7 @@ standard-library only. See
 docs/superpowers/specs/2026-05-31-toks-lmstudio-provider-design.md
 docs/superpowers/specs/2026-06-06-mlx-provider-design.md
 docs/specs/2026-06-24-unsloth-studio-provider-and-bpw-design.md
+docs/specs/2026-06-25-unsloth-local-listing-and-bench-backend-identity-design.md
 """
 import argparse
 import concurrent.futures
@@ -68,6 +69,29 @@ class ModelRecord:
 class BenchResult:
     tokens_per_second: float
     time_to_first_token: float | None = None
+    tps_source: str | None = None        # measurement path: ollama|lmstudio_stats|
+                                         # llamacpp_timings|client_timed
+    observed_backend: str | None = None  # engine inferred from the response:
+                                         # ollama|lmstudio|llamacpp|mlx_lm|unknown
+    system_fingerprint: str | None = None
+
+
+def _looks_llamacpp_fingerprint(fingerprint):
+    """True for a llama.cpp build fingerprint like 'b9773-<hash>'."""
+    head = str(fingerprint or "").split("-", 1)[0]
+    return len(head) > 1 and head[0] == "b" and head[1:].isdigit()
+
+
+def _classify_streamed_backend(fingerprint, saw_timings, otherwise):
+    """Infer the engine behind an OpenAI-style stream from its tells.
+
+    A llama.cpp `timings` block or a `b<build>-…` fingerprint is conclusive;
+    otherwise fall back to the caller's expected engine (the mlx provider knows a
+    plain stream is mlx_lm; Studio, being multi-runtime, settles for 'unknown').
+    """
+    if saw_timings or _looks_llamacpp_fingerprint(fingerprint):
+        return "llamacpp"
+    return otherwise
 
 
 def _looks_moe(*texts):
@@ -153,7 +177,9 @@ def parse_lmstudio_bench(response):
     ttft = stats.get("time_to_first_token")
     if not isinstance(ttft, (int, float)):
         ttft = None
-    return BenchResult(float(tps), ttft)
+    return BenchResult(float(tps), ttft, tps_source="lmstudio_stats",
+                       observed_backend="lmstudio",
+                       system_fingerprint=(response or {}).get("system_fingerprint"))
 
 
 def parse_ollama_bench(response):
@@ -172,7 +198,7 @@ def parse_ollama_bench(response):
     prompt_eval = response.get("prompt_eval_duration")
     if isinstance(prompt_eval, (int, float)) and prompt_eval > 0:
         ttft = (float(load) + float(prompt_eval)) / 1_000_000_000.0
-    return BenchResult(tps, ttft)
+    return BenchResult(tps, ttft, tps_source="ollama", observed_backend="ollama")
 
 
 # --- formatting helpers (ported from the original ollama-list-with-tps) ------
@@ -465,6 +491,37 @@ def _mlx_snapshot(hub_root, model_id):
     return (snapshot, ref) if snapshot.is_dir() else (None, None)
 
 
+def _apply_safetensors_config(rec, config):
+    """Backfill fmt/ctx/quant/MoE/params on rec from a parsed safetensors (MLX)
+    config.json. Params are size-derived, so rec.size_bytes must already be set.
+    Shared by the mlx provider and the unsloth provider's MLX fallback.
+    """
+    rec.fmt = "safetensors"
+    ctx = config.get("max_position_embeddings")
+    if isinstance(ctx, int) and ctx > 0:
+        rec.ctx_max = ctx
+    quant = config.get("quantization")
+    bits = quant.get("bits") if isinstance(quant, dict) else None
+    if isinstance(bits, (int, float)) and bits > 0:
+        rec.quant = f"{bits:g}bit"
+        bpw = float(bits) + 0.5    # payload + quant scales, as elsewhere
+    else:
+        bpw = 16.0                 # unquantized MLX models ship bf16
+    rec.moe = any(
+        isinstance(value, int) and value > 1 and "expert" in key
+        for key, value in config.items()
+    )
+    if rec.size_bytes:
+        total = int(float(rec.size_bytes) * 8.0 / bpw)
+        rec.param_count = total
+        rec.param_estimated = True   # always size-derived for MLX repos
+        text = human_params(
+            total, config.get("num_experts"), config.get("num_experts_per_tok"))
+        if text != "-":
+            text = "~" + text      # estimated from size, like Ollama's path
+        rec.params = text
+
+
 def mlx_enrich(records, hub_root):
     """Best-effort backfill of size/quant/ctx/MoE/params from the local HF cache.
 
@@ -498,29 +555,7 @@ def mlx_enrich(records, hub_root):
         if not isinstance(config, dict) or not config.get("model_type"):
             rec.benchmarkable = False
             continue
-        ctx = config.get("max_position_embeddings")
-        if isinstance(ctx, int) and ctx > 0:
-            rec.ctx_max = ctx
-        quant = config.get("quantization")
-        bits = quant.get("bits") if isinstance(quant, dict) else None
-        if isinstance(bits, (int, float)) and bits > 0:
-            rec.quant = f"{bits:g}bit"
-            bpw = float(bits) + 0.5    # payload + quant scales, as elsewhere
-        else:
-            bpw = 16.0                 # unquantized MLX models ship bf16
-        rec.moe = any(
-            isinstance(value, int) and value > 1 and "expert" in key
-            for key, value in config.items()
-        )
-        if rec.size_bytes:
-            total = int(float(rec.size_bytes) * 8.0 / bpw)
-            rec.param_count = total
-            rec.param_estimated = True   # always size-derived for MLX repos
-            text = human_params(
-                total, config.get("num_experts"), config.get("num_experts_per_tok"))
-            if text != "-":
-                text = "~" + text      # estimated from size, like Ollama's path
-            rec.params = text
+        _apply_safetensors_config(rec, config)
 
 
 def bench_from_sse(lines, start, clock=time.monotonic):
@@ -532,10 +567,17 @@ def bench_from_sse(lines, start, clock=time.monotonic):
     eval. The token count comes from the final usage chunk (requested via
     stream_options include_usage), falling back to counting content chunks.
     Returns None when nothing measurable arrived.
+
+    Even though we client-time, we still inspect each event for a llama.cpp
+    `timings` block or a `b<build>-…` fingerprint: their presence means the port
+    is actually a llama.cpp server, not mlx_lm -- the tell that catches an
+    impostor squatting on the mlx default port.
     """
     first = last = None
     chunk_count = 0
     completion_tokens = None
+    fingerprint = None
+    saw_timings = False
     for raw in lines:
         line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
         line = line.strip()
@@ -548,6 +590,10 @@ def bench_from_sse(lines, start, clock=time.monotonic):
             event = json.loads(payload)
         except json.JSONDecodeError:
             continue
+        if event.get("system_fingerprint"):
+            fingerprint = event["system_fingerprint"]
+        if isinstance(event.get("timings"), dict):
+            saw_timings = True
         usage = event.get("usage")
         if isinstance(usage, dict):
             tokens = usage.get("completion_tokens")
@@ -569,7 +615,11 @@ def bench_from_sse(lines, start, clock=time.monotonic):
     tokens = completion_tokens or chunk_count
     if tokens < 2:
         return None
-    return BenchResult((tokens - 1) / (last - first), first - start)
+    return BenchResult(
+        (tokens - 1) / (last - first), first - start, tps_source="client_timed",
+        observed_backend=_classify_streamed_backend(fingerprint, saw_timings,
+                                                     otherwise="mlx_lm"),
+        system_fingerprint=fingerprint)
 
 
 # --- Unsloth Studio provider parsing (llama.cpp server) ----------------------
@@ -695,21 +745,39 @@ def select_main_gguf(snapshot):
     return candidates[0][1]
 
 
-def unsloth_parse_models(payload):
-    """Parse a GET /v1/models response from Unsloth Studio into ModelRecords.
+# Best-effort backstop for the non-text models Studio's can_chat flag mislabels
+# (embeddings report can_chat=True; speech models likewise). Matched as a
+# case-insensitive substring of the repo id.
+NON_TEXTGEN_HINTS = ("bge", "embed", "rerank", "tts", "stt", "whisper", "asr")
 
-    Like mlx, the listing carries only model ids (HF repo ids); GGUF metadata is
-    backfilled from the local HF cache by unsloth_enrich.
+
+def unsloth_parse_local(payload):
+    """Parse a GET /api/hub/local response from Unsloth Studio into ModelRecords.
+
+    Studio's local inventory enumerates downloaded models across every source it
+    sees (its HF cache, LM Studio, Ollama). We keep only the HF-cache,
+    text-generation models: that is the shared store where Unsloth-served GGUF and
+    MLX/safetensors weights live, so the listing is format-agnostic (a future
+    `…-MLX-8bit` build appears automatically) without re-listing the very models
+    toks' own lmstudio/ollama providers already report.
+
+    Deliberately NOT namespace-scoped to `unsloth/*`: an `mlx-community/*` chat
+    model in the HF cache is listed here too, so Studio's throughput for the exact
+    same files can be compared against the `mlx` provider's number.
+
+    Like mlx, only the id (an HF repo id) is taken here; size/quant/params/ctx are
+    backfilled from the cached weights by unsloth_enrich. Text-gen classification
+    is best-effort (Studio's flags are incomplete).
     """
-    data = (payload or {}).get("data")
-    if not isinstance(data, list):
+    models = (payload or {}).get("models")
+    if not isinstance(models, list):
         return []
     records = []
-    for item in data:
+    for item in models:
         if not isinstance(item, dict):
             continue
         model_id = item.get("id")
-        if not model_id:
+        if not model_id or not _unsloth_is_listable(item):
             continue
         records.append(
             ModelRecord(
@@ -722,43 +790,80 @@ def unsloth_parse_models(payload):
     return records
 
 
-def unsloth_enrich(records, hub_root):
-    """Backfill size/quant/params/ctx/MoE from each model's cached GGUF.
+def _unsloth_is_listable(item):
+    """True for a downloaded, HF-cache, text-generation model worth listing."""
+    if item.get("source") != "hf_cache":
+        return False                                  # other providers' territory
+    if item.get("model_format") not in ("gguf", "safetensors"):
+        return False                                  # unknown/partial junk
+    if not (item.get("capabilities") or {}).get("can_chat"):
+        return False                                  # image gen etc.
+    lowered = str(item.get("id", "")).lower()
+    return not any(hint in lowered for hint in NON_TEXTGEN_HINTS)
 
-    Meaningful only when toks runs on the server's machine (the default localhost
-    setup). Reads the main weights GGUF's header; absent repos or malformed files
-    leave the record untouched -- never raises.
+
+def _snapshot_modified_at(rec, ref):
+    """Set rec.modified_at from the HF-cache ref's mtime (no-op for path ids)."""
+    if ref is None:
+        return
+    try:
+        mtime = ref.stat().st_mtime
+        rec.modified_at = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+    except OSError:
+        pass
+
+
+def unsloth_enrich(records, hub_root):
+    """Backfill size/quant/params/ctx/MoE from each model's cached weights.
+
+    Reads the main GGUF header for an *exact* param count when one is present;
+    otherwise falls back to the safetensors/MLX config.json (size-derived, like
+    the mlx provider) so the MLX builds listed for cross-runtime comparison still
+    show metadata. Meaningful only on the server's machine; absent repos or
+    malformed files leave the record untouched -- never raises.
     """
     for rec in records:
         snapshot, ref = _mlx_snapshot(hub_root, rec.name)
         if snapshot is None:
             continue
         main = select_main_gguf(snapshot)
-        if main is None:
-            continue
-        try:
-            rec.size_bytes = main.stat().st_size
-        except OSError:
-            pass
-        if ref is not None:
+        if main is not None:
             try:
-                mtime = ref.stat().st_mtime
-                rec.modified_at = datetime.fromtimestamp(mtime, tz=timezone.utc).isoformat()
+                rec.size_bytes = main.stat().st_size
             except OSError:
                 pass
-        meta = read_gguf_meta(main)
-        if not meta:
+            _snapshot_modified_at(rec, ref)
+            meta = read_gguf_meta(main)
+            if not meta:
+                continue
+            rec.fmt = "gguf"
+            if meta["quant"]:
+                rec.quant = meta["quant"]
+            if meta["ctx"]:
+                rec.ctx_max = meta["ctx"]
+            expert_count = meta["expert_count"]
+            rec.moe = bool(isinstance(expert_count, int) and expert_count > 1)
+            rec.param_count = meta["param_count"]
+            rec.param_estimated = False      # exact, summed from the tensor table
+            rec.params = human_params(
+                meta["param_count"], expert_count, meta["expert_used"])
             continue
-        rec.fmt = "gguf"
-        if meta["quant"]:
-            rec.quant = meta["quant"]
-        if meta["ctx"]:
-            rec.ctx_max = meta["ctx"]
-        expert_count = meta["expert_count"]
-        rec.moe = bool(isinstance(expert_count, int) and expert_count > 1)
-        rec.param_count = meta["param_count"]
-        rec.param_estimated = False      # exact, summed from the tensor table
-        rec.params = human_params(meta["param_count"], expert_count, meta["expert_used"])
+        # No GGUF -> an MLX/safetensors build (e.g. an mlx-community repo listed
+        # for cross-runtime comparison): enrich from config.json, size-derived.
+        try:
+            with (snapshot / "config.json").open("r", encoding="utf-8") as handle:
+                config = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(config, dict) or not config.get("model_type"):
+            continue
+        try:
+            rec.size_bytes = sum(
+                f.stat().st_size for f in snapshot.rglob("*") if f.is_file())
+        except OSError:
+            pass
+        _snapshot_modified_at(rec, ref)
+        _apply_safetensors_config(rec, config)
 
 
 def parse_llamacpp_timings(response):
@@ -778,7 +883,9 @@ def parse_llamacpp_timings(response):
     prompt_ms = timings.get("prompt_ms")
     if isinstance(prompt_ms, (int, float)) and prompt_ms > 0:
         ttft = float(prompt_ms) / 1000.0
-    return BenchResult(float(tps), ttft)
+    return BenchResult(float(tps), ttft, tps_source="llamacpp_timings",
+                       observed_backend="llamacpp",
+                       system_fingerprint=(response or {}).get("system_fingerprint"))
 
 
 def bench_unsloth_sse(lines, start, clock=time.monotonic):
@@ -793,6 +900,7 @@ def bench_unsloth_sse(lines, start, clock=time.monotonic):
     chunk_count = 0
     completion_tokens = None
     server = None
+    fingerprint = None
     for raw in lines:
         line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
         line = line.strip()
@@ -805,6 +913,8 @@ def bench_unsloth_sse(lines, start, clock=time.monotonic):
             event = json.loads(payload)
         except json.JSONDecodeError:
             continue
+        if event.get("system_fingerprint"):
+            fingerprint = event["system_fingerprint"]
         if server is None:
             server = parse_llamacpp_timings(event)
         usage = event.get("usage")
@@ -830,7 +940,12 @@ def bench_unsloth_sse(lines, start, clock=time.monotonic):
     tokens = completion_tokens or chunk_count
     if tokens < 2:
         return None
-    return BenchResult((tokens - 1) / (last - first), first - start)
+    # No llama.cpp timings: Studio served via another runtime (transformers/mlx).
+    return BenchResult(
+        (tokens - 1) / (last - first), first - start, tps_source="client_timed",
+        observed_backend=_classify_streamed_backend(fingerprint, False,
+                                                     otherwise="unknown"),
+        system_fingerprint=fingerprint)
 
 
 # --- shared rendering -------------------------------------------------------
@@ -1145,6 +1260,7 @@ def fetch_all_model_info(host, models):
 
 class OllamaProvider:
     name = "ollama"
+    expected_backend = "ollama"
 
     def __init__(self):
         self.host = ollama_url()
@@ -1170,6 +1286,7 @@ class OllamaProvider:
 
 class LMStudioProvider:
     name = "lmstudio"
+    expected_backend = "lmstudio"
 
     def __init__(self):
         self.host = lmstudio_url()
@@ -1213,6 +1330,7 @@ class LMStudioProvider:
 
 class MlxProvider:
     name = "mlx"
+    expected_backend = "mlx_lm"
 
     def __init__(self):
         self.host = mlx_url()
@@ -1251,16 +1369,20 @@ class MlxProvider:
 
 class UnslothProvider:
     name = "unsloth"
+    expected_backend = None      # Studio is multi-runtime: record, don't flag
 
     def __init__(self):
         self.host = unsloth_url()
         self.headers = unsloth_headers()
 
     def list_models(self):
-        data = http_json(f"{self.host}/v1/models", headers=self.headers, timeout=LIST_TIMEOUT)
-        records = unsloth_parse_models(data)
-        # Listing is ids-only; the GGUF metadata lives in the HF cache, readable
-        # only when Studio runs on this machine (the default localhost setup).
+        # /v1/models lists only the *loaded* model; /api/hub/local lists every
+        # downloaded model, which is what "list local models" means here.
+        data = http_json(f"{self.host}/api/hub/local", headers=self.headers,
+                         timeout=LIST_TIMEOUT)
+        records = unsloth_parse_local(data)
+        # Listing is ids-only; the weights' metadata lives in the HF cache,
+        # readable only when Studio runs on this machine (the default localhost).
         if records and is_local_host(self.host):
             unsloth_enrich(records, hf_hub_root())
         return records
@@ -1401,11 +1523,27 @@ def run_benchmarks(records, active, cache):
         if result is None:
             print(f"warning: no throughput stats returned for {rec.name}", file=sys.stderr)
             continue
+        host = getattr(provider, "host", None)
+        expected = getattr(provider, "expected_backend", None)
+        observed = result.observed_backend
+        # The cached number is only trustworthy if we know who served it. The
+        # 'provider' field is just the configured label for whatever answered at
+        # this URL; record the *observed* engine, and shout if it isn't the one
+        # this port is supposed to host (e.g. a llama.cpp server squatting on the
+        # mlx port) so a mislabeled number can't poison cross-runtime comparisons.
+        if expected and observed and observed not in ("unknown", expected):
+            print(f"warning: {rec.name}: expected {expected} at {host} but "
+                  f"observed {observed} (fingerprint={result.system_fingerprint}); "
+                  "recording the observed backend", file=sys.stderr)
         cache[cache_key(rec)] = {
             "provider": rec.provider,
             "model": rec.name,
             "tokens_per_second": result.tokens_per_second,
             "time_to_first_token": result.time_to_first_token,
+            "endpoint": host,
+            "tps_source": result.tps_source,
+            "observed_backend": observed,
+            "system_fingerprint": result.system_fingerprint,
             "benchmarked_at": int(time.time()),
             "prompt": DEFAULT_PROMPT,
             "max_tokens": DEFAULT_MAX_TOKENS,
