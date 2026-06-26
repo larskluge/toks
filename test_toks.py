@@ -1208,6 +1208,19 @@ class ServedModelMatchesTests(unittest.TestCase):
         self.assertFalse(toks.served_model_matches("acme/demo-31B-it-GGUF",
                                                     "other/llama-3b"))
 
+    def test_hf_cache_path_served_matches_repo_id(self):
+        # Studio reports the loaded model as its on-disk HF-cache path; the
+        # `models--org--name` segment encodes the requested repo id, and the
+        # filename carries an extra quant suffix that bare basename matching misses.
+        served = ("/home/u/.cache/huggingface/hub/models--acme--demo-31B-it-GGUF/"
+                  "snapshots/abc123/demo-31B-it-UD-Q4_K_XL.gguf")
+        self.assertTrue(toks.served_model_matches("acme/demo-31B-it-GGUF", served))
+
+    def test_hf_cache_path_for_other_model_is_mismatch(self):
+        served = ("/home/u/.cache/huggingface/hub/models--other--llama-3b/"
+                  "snapshots/abc123/llama-3b-Q4_K_M.gguf")
+        self.assertFalse(toks.served_model_matches("acme/demo-31B-it-GGUF", served))
+
     def test_unknown_served_cannot_be_verified(self):
         # No served id (server didn't echo one) -> don't block the benchmark.
         self.assertTrue(toks.served_model_matches("acme/demo", ""))

@@ -957,18 +957,38 @@ def llama_enrich(records, props):
             pass
 
 
+def _canonical_model_id(value):
+    """Reduce a model id to a comparable `org/name` form, lower-cased.
+
+    Studio's two endpoints name the *same* loaded model differently: the
+    `llama-server` (`:11435`) echoes the clean repo id `org/name`, while Studio's
+    own API (`:8888`) echoes the on-disk **HF-cache path**
+    `.../models--org--name/snapshots/<sha>/<file>.gguf`. The cache dir encodes the
+    repo id (`models--org--name` -> `org/name`), so we recover it from any path
+    that contains such a segment; a plain id or bare alias passes through unchanged.
+    """
+    s = str(value or "").strip().lower().replace("\\", "/")
+    if not s:
+        return ""
+    for part in s.split("/"):
+        if part.startswith("models--"):
+            return part[len("models--"):].replace("--", "/")
+    return s
+
+
 def served_model_matches(requested, served):
     """True when the model a llama.cpp server actually served is the requested one.
 
     llama.cpp (and Unsloth Studio on top of it) echo the *loaded* model's id in the
     response `model` field, not the requested name -- so a benchmark only measures
-    the model we asked for when the two agree. Compares case-insensitively on the
-    full id and on the bare alias (the part after the last '/'), so a server that
-    reports just `demo-GGUF` for a requested `org/demo-GGUF` still matches. An empty
-    `served` means the server didn't tell us, so we can't verify and don't block.
+    the model we asked for when the two agree. Both sides are canonicalised to
+    `org/name` (decoding HF-cache paths), then compared on the full id and on the
+    bare alias (the part after the last '/') so a server that reports just
+    `demo-GGUF` for a requested `org/demo-GGUF` still matches. An empty `served`
+    means the server didn't tell us, so we can't verify and don't block.
     """
-    req = str(requested or "").strip().lower()
-    srv = str(served or "").strip().lower()
+    req = _canonical_model_id(requested)
+    srv = _canonical_model_id(served)
     if not req or not srv:
         return True
     if req == srv:
