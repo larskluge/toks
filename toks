@@ -1532,42 +1532,57 @@ class UnslothProvider:
             unsloth_enrich(records, hf_hub_root())
         return records
 
+    def _warmup(self, rec, prompt):
+        """1-token warmup that reveals the served model and which endpoint works.
+
+        Returns (served_model_id, use_chat). Studio serves GGUF via /v1/completions
+        but MLX/transformers models *only* via /v1/chat/completions (completions
+        503s "No GGUF model loaded"), so we try completions first and fall back to
+        chat. `served` is the loaded model's id echoed in the response (None if
+        neither warmup yields one); the warmup also absorbs any load time.
+        """
+        base = {"model": rec.name, "max_tokens": 1, "stream": False, "temperature": 0}
+        try:
+            resp = http_json(f"{self.host}/v1/completions",
+                             payload={**base, "prompt": prompt},
+                             headers=self.headers, timeout=BENCH_TIMEOUT)
+            return (resp.get("model") if isinstance(resp, dict) else None), False
+        except RuntimeError:
+            pass        # completions unavailable (e.g. an MLX model is loaded)
+        try:
+            resp = http_json(f"{self.host}/v1/chat/completions",
+                             payload={**base, "messages": [{"role": "user",
+                                                            "content": prompt}]},
+                             headers=self.headers, timeout=BENCH_TIMEOUT)
+            return (resp.get("model") if isinstance(resp, dict) else None), True
+        except RuntimeError:
+            return None, True   # neither warmup worked; try a chat stream anyway
+
     def benchmark(self, rec, prompt, max_tokens):
-        # Unsloth Studio is a llama.cpp server: a 1-token warmup absorbs any load
-        # time, then we read its server-side `timings` from the stream (falling
-        # back to client-side timing). Auth token rides on every request.
-        #
         # Studio serves whatever single model is currently loaded, ignoring the
         # requested `model` -- so a bench of model A can silently measure model B.
-        # The warmup response echoes the *loaded* model's id (llama.cpp reports the
-        # served model, not the requested name); verify it matches before trusting
-        # the timings, and skip (don't cache a mislabeled number) when it doesn't.
-        warmup = {"model": rec.name, "prompt": prompt, "max_tokens": 1,
-                  "stream": False, "temperature": 0}
-        served = None
-        try:
-            resp = http_json(f"{self.host}/v1/completions", payload=warmup,
-                             headers=self.headers, timeout=BENCH_TIMEOUT)
-            if isinstance(resp, dict):
-                served = resp.get("model")
-        except RuntimeError:
-            pass        # can't read the served model -> can't verify; proceed
+        # The warmup response echoes the *loaded* model's id; verify it matches
+        # before trusting the stream, and skip (don't cache a mislabeled number)
+        # when it doesn't. The warmup also tells us which endpoint serves this
+        # model: GGUF via /v1/completions, MLX/transformers via /v1/chat/completions.
+        served, use_chat = self._warmup(rec, prompt)
         if not served_model_matches(rec.name, served):
             raise RuntimeError(
                 f"{self.host} served '{served}', not the requested '{rec.name}' "
                 "(Studio benchmarks its one loaded model regardless of the "
                 "requested name); skipping to avoid a mislabeled number")
-        payload = {
-            "model": rec.name,
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "stream": True,
-            "stream_options": {"include_usage": True},
-            "temperature": 0,
-        }
+        common = {"model": rec.name, "max_tokens": max_tokens, "stream": True,
+                  "stream_options": {"include_usage": True}, "temperature": 0}
+        if use_chat:
+            endpoint = f"{self.host}/v1/chat/completions"
+            payload = {**common, "messages": [{"role": "user", "content": prompt}]}
+        else:
+            endpoint = f"{self.host}/v1/completions"
+            payload = {**common, "prompt": prompt}
+        # GGUF streams carry llama.cpp `timings`; MLX/transformers ones don't, so
+        # bench_llamacpp_sse falls back to client-side timing (delta-aware).
         start = time.monotonic()
-        lines = http_sse(f"{self.host}/v1/completions", payload, BENCH_TIMEOUT,
-                         headers=self.headers)
+        lines = http_sse(endpoint, payload, BENCH_TIMEOUT, headers=self.headers)
         return bench_llamacpp_sse(lines, start)
 
 

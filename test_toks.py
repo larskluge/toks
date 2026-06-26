@@ -1279,6 +1279,38 @@ class UnslothBenchGuardTests(unittest.TestCase):
             result = provider.benchmark(self._rec(), "p", 8)
         self.assertAlmostEqual(result.tokens_per_second, 5.0)
 
+    def test_falls_back_to_chat_completions_for_mlx(self):
+        # /v1/completions 503s for MLX models; fall back to /v1/chat/completions.
+        provider = toks.UnslothProvider()
+        # completions warmup raises (GGUF-only 503); chat warmup echoes the model.
+        warm = mock.Mock(side_effect=[RuntimeError("HTTP 503"),
+                                      {"model": "acme/demo-31B-it-GGUF"}])
+        chat_stream = _sse({"choices": [{"delta": {"content": "a"}}]},
+                           {"choices": [{"delta": {"content": "b"}}]},
+                           {"choices": [], "usage": {"completion_tokens": 20}})
+        with mock.patch.object(toks, "http_json", warm), \
+                mock.patch.object(toks, "http_sse",
+                                  return_value=chat_stream) as sse:
+            result = provider.benchmark(self._rec(), "p", 8)
+        self.assertIsNotNone(result)
+        # streamed against the chat endpoint with a messages payload, not a prompt.
+        url, payload = sse.call_args[0][0], sse.call_args[0][1]
+        self.assertTrue(url.endswith("/v1/chat/completions"))
+        self.assertIn("messages", payload)
+        self.assertNotIn("prompt", payload)
+
+    def test_chat_fallback_still_guards_mismatch(self):
+        # Even on the chat path, a mismatched served model is skipped.
+        provider = toks.UnslothProvider()
+        warm = mock.Mock(side_effect=[RuntimeError("HTTP 503"),
+                                      {"model": "other/small-model"}])
+        with mock.patch.object(toks, "http_json", warm), \
+                mock.patch.object(toks, "http_sse") as sse:
+            with self.assertRaises(RuntimeError) as ctx:
+                provider.benchmark(self._rec(), "p", 8)
+        self.assertIn("other/small-model", str(ctx.exception))
+        sse.assert_not_called()
+
 
 class LlamaCppTimingsTests(unittest.TestCase):
     def test_reads_predicted_per_second_and_ttft(self):
