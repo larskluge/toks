@@ -1191,6 +1191,82 @@ class UnslothListModelsTests(unittest.TestCase):
         self.assertTrue(hj.call_args[0][0].endswith("/api/hub/local"))
 
 
+class ServedModelMatchesTests(unittest.TestCase):
+    def test_exact_match(self):
+        self.assertTrue(toks.served_model_matches("acme/demo-31B-it-GGUF",
+                                                   "acme/demo-31B-it-GGUF"))
+
+    def test_case_insensitive(self):
+        self.assertTrue(toks.served_model_matches("Acme/Demo", "acme/demo"))
+
+    def test_basename_match_ignores_org_or_path_prefix(self):
+        # Studio may report the loaded model's bare alias without the org prefix.
+        self.assertTrue(toks.served_model_matches("acme/demo-31B-it-GGUF",
+                                                   "demo-31B-it-GGUF"))
+
+    def test_different_model_is_mismatch(self):
+        self.assertFalse(toks.served_model_matches("acme/demo-31B-it-GGUF",
+                                                    "other/llama-3b"))
+
+    def test_unknown_served_cannot_be_verified(self):
+        # No served id (server didn't echo one) -> don't block the benchmark.
+        self.assertTrue(toks.served_model_matches("acme/demo", ""))
+        self.assertTrue(toks.served_model_matches("acme/demo", None))
+
+
+class UnslothBenchGuardTests(unittest.TestCase):
+    """Studio serves its one loaded model regardless of the requested name, so a
+    benchmark must verify the served model before trusting (and caching) timings.
+    """
+
+    def _rec(self):
+        return toks.ModelRecord("unsloth", "acme/demo-31B-it-GGUF")
+
+    def test_skips_when_server_serves_a_different_model(self):
+        provider = toks.UnslothProvider()
+        warm = {"model": "other/small-model"}
+        with mock.patch.object(toks, "http_json", return_value=warm), \
+                mock.patch.object(toks, "http_sse") as sse:
+            with self.assertRaises(RuntimeError) as ctx:
+                provider.benchmark(self._rec(), "p", 8)
+        self.assertIn("other/small-model", str(ctx.exception))
+        sse.assert_not_called()              # never ran the timed stream
+
+    def test_proceeds_when_served_model_matches(self):
+        provider = toks.UnslothProvider()
+        warm = {"model": "acme/demo-31B-it-GGUF"}
+        stream = _sse({"choices": [{"text": "a"}]},
+                      {"choices": [], "usage": {"completion_tokens": 50},
+                       "timings": {"predicted_per_second": 42.0, "prompt_ms": 100.0}})
+        with mock.patch.object(toks, "http_json", return_value=warm), \
+                mock.patch.object(toks, "http_sse", return_value=stream):
+            result = provider.benchmark(self._rec(), "p", 8)
+        self.assertAlmostEqual(result.tokens_per_second, 42.0)
+
+    def test_proceeds_when_served_model_unknown(self):
+        # A server that doesn't echo a model id can't be verified -> don't block.
+        provider = toks.UnslothProvider()
+        stream = _sse({"choices": [{"text": "a"}]},
+                      {"choices": [], "usage": {"completion_tokens": 50},
+                       "timings": {"predicted_per_second": 7.0}})
+        with mock.patch.object(toks, "http_json", return_value={"no": "model"}), \
+                mock.patch.object(toks, "http_sse", return_value=stream):
+            result = provider.benchmark(self._rec(), "p", 8)
+        self.assertAlmostEqual(result.tokens_per_second, 7.0)
+
+    def test_proceeds_when_warmup_fails(self):
+        # Warmup error (can't read served model) must not block benchmarking.
+        provider = toks.UnslothProvider()
+        stream = _sse({"choices": [{"text": "a"}]},
+                      {"choices": [], "usage": {"completion_tokens": 50},
+                       "timings": {"predicted_per_second": 5.0}})
+        with mock.patch.object(toks, "http_json",
+                               side_effect=RuntimeError("warmup boom")), \
+                mock.patch.object(toks, "http_sse", return_value=stream):
+            result = provider.benchmark(self._rec(), "p", 8)
+        self.assertAlmostEqual(result.tokens_per_second, 5.0)
+
+
 class LlamaCppTimingsTests(unittest.TestCase):
     def test_reads_predicted_per_second_and_ttft(self):
         result = toks.parse_llamacpp_timings(

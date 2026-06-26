@@ -957,6 +957,25 @@ def llama_enrich(records, props):
             pass
 
 
+def served_model_matches(requested, served):
+    """True when the model a llama.cpp server actually served is the requested one.
+
+    llama.cpp (and Unsloth Studio on top of it) echo the *loaded* model's id in the
+    response `model` field, not the requested name -- so a benchmark only measures
+    the model we asked for when the two agree. Compares case-insensitively on the
+    full id and on the bare alias (the part after the last '/'), so a server that
+    reports just `demo-GGUF` for a requested `org/demo-GGUF` still matches. An empty
+    `served` means the server didn't tell us, so we can't verify and don't block.
+    """
+    req = str(requested or "").strip().lower()
+    srv = str(served or "").strip().lower()
+    if not req or not srv:
+        return True
+    if req == srv:
+        return True
+    return req.rsplit("/", 1)[-1] == srv.rsplit("/", 1)[-1]
+
+
 def parse_llamacpp_timings(response):
     """Read server-measured throughput from a llama.cpp `timings` block.
 
@@ -1497,13 +1516,27 @@ class UnslothProvider:
         # Unsloth Studio is a llama.cpp server: a 1-token warmup absorbs any load
         # time, then we read its server-side `timings` from the stream (falling
         # back to client-side timing). Auth token rides on every request.
+        #
+        # Studio serves whatever single model is currently loaded, ignoring the
+        # requested `model` -- so a bench of model A can silently measure model B.
+        # The warmup response echoes the *loaded* model's id (llama.cpp reports the
+        # served model, not the requested name); verify it matches before trusting
+        # the timings, and skip (don't cache a mislabeled number) when it doesn't.
         warmup = {"model": rec.name, "prompt": prompt, "max_tokens": 1,
                   "stream": False, "temperature": 0}
+        served = None
         try:
-            http_json(f"{self.host}/v1/completions", payload=warmup,
-                      headers=self.headers, timeout=BENCH_TIMEOUT)
+            resp = http_json(f"{self.host}/v1/completions", payload=warmup,
+                             headers=self.headers, timeout=BENCH_TIMEOUT)
+            if isinstance(resp, dict):
+                served = resp.get("model")
         except RuntimeError:
-            pass
+            pass        # can't read the served model -> can't verify; proceed
+        if not served_model_matches(rec.name, served):
+            raise RuntimeError(
+                f"{self.host} served '{served}', not the requested '{rec.name}' "
+                "(Studio benchmarks its one loaded model regardless of the "
+                "requested name); skipping to avoid a mislabeled number")
         payload = {
             "model": rec.name,
             "prompt": prompt,
