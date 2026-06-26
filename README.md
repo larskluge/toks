@@ -1,9 +1,9 @@
 # toks
 
 List local LLMs across backends — **Ollama**, **LM Studio**, **mlx-lm**
-(`mlx_lm.server`), and **Unsloth Studio** — in one table, ranked by cached
-tokens/sec and annotated with effective **bits/weight**. Single file, Python 3
-standard library only.
+(`mlx_lm.server`), **Unsloth Studio**, and a **llama.cpp server**
+(`llama-server`) — in one table, ranked by cached tokens/sec and annotated with
+effective **bits/weight**. Single file, Python 3 standard library only.
 
 ```
 $ toks
@@ -30,7 +30,7 @@ header); a leading `~` marks counts estimated from file size. `SIZE` is binary
 
 ```
 toks                            # list models from all reachable backends
-toks --provider ollama          # one backend only (ollama | lmstudio | mlx | unsloth | all)
+toks --provider ollama          # one backend only (ollama | lmstudio | mlx | unsloth | llama | all)
 toks --bench                    # benchmark models with no cached value (= --bench missing)
 toks --bench all                # benchmark every model, cache the result
 toks --bench qwen3.6:27b-mlx    # benchmark the named model(s)
@@ -50,9 +50,10 @@ server's own `stats` — so benchmarking a **remote** LM Studio (e.g. on another
 stays accurate, since those numbers are measured server-side. mlx-lm reports no
 server-side stats, so `toks` times the SSE stream client-side (TTFT = first chunk,
 throughput over the first→last chunk interval) — accurate for the localhost default;
-over a network, latency leaks into the numbers. Unsloth Studio is a llama.cpp
-server, so `toks` reads its server-measured `timings` (`predicted_per_second`,
-`prompt_ms`) from the stream — accurate even over a network.
+over a network, latency leaks into the numbers. Unsloth Studio and a plain
+`llama-server` are both llama.cpp servers, so `toks` reads their server-measured
+`timings` (`predicted_per_second`, `prompt_ms`) from the stream — accurate even
+over a network.
 
 Each cached benchmark records the **observed backend** — the engine inferred from
 the response shape (Ollama counters, LM Studio `stats`, llama.cpp `timings`, or a
@@ -73,6 +74,8 @@ truth, so cross-runtime comparisons stay honest.
 | `MLX_URL` | `http://localhost:8080` | mlx_lm.server endpoint |
 | `UNSLOTH_URL` | `http://127.0.0.1:8888` | Unsloth Studio endpoint |
 | `UNSLOTH_API_KEY` | — | `Authorization: Bearer` token for Unsloth Studio (required) |
+| `LLAMA_URL` | `http://127.0.0.1:11435` | llama.cpp `llama-server` endpoint |
+| `LLAMA_API_KEY` | — | optional `Authorization: Bearer` token (if started with `--api-key`) |
 | `HF_HUB_CACHE` / `HF_HOME` | `~/.cache/huggingface/hub` | HF cache used for mlx / Unsloth (GGUF) metadata enrichment |
 | `XDG_CACHE_HOME` | `~/.cache` | cache location root |
 | `XDG_CONFIG_HOME` | `~/.config` | location of the optional `.env` (see below) |
@@ -134,6 +137,22 @@ best-effort backfill from the richer `/api/v1/models` (LM Studio 0.4.0+) and sho
    head); `toks` sizes and parses the main weights file, ignoring those.
 6. Models are usually already resident; the usual 1-token warmup absorbs any load.
 
+## llama.cpp server prerequisites
+
+1. Start `llama-server` (default `LLAMA_URL` is `http://127.0.0.1:11435`); pass
+   `--api-key` and set `LLAMA_API_KEY` if you gate it.
+2. Listing uses `GET /v1/models`, whose `meta` block already carries the exact
+   parameter count, on-disk size, and context length — so those columns are
+   populated even for a **remote** `LLAMA_URL`. Format is always `gguf`.
+3. The **quant** (and thus `BPW`/`TAG` detail) is not in the listing; `toks` reads
+   it from the loaded model's GGUF header, whose path it gets from `GET /props`
+   (`model_path`). This works only when `toks` runs on the server's machine; off-box
+   that path isn't visible, so `BPW` falls back to `-` (the rest still shows).
+4. Throughput comes from the server's own llama.cpp `timings` — accurate even over
+   a network. Since `llama-server` *is* the Unsloth Studio runtime in some setups,
+   the same weights can appear under both `unsloth` and `llama`; they list and cache
+   separately on purpose, so the two entry points can be compared.
+
 ## Behaviour with one backend down
 
 `toks` (provider `all`) lists whatever is reachable and prints a single
@@ -152,5 +171,6 @@ python3 -m unittest test_toks   # network-free unit tests
 
 See `docs/superpowers/specs/2026-05-31-toks-lmstudio-provider-design.md`,
 `docs/superpowers/specs/2026-06-06-mlx-provider-design.md`,
-`docs/specs/2026-06-24-unsloth-studio-provider-and-bpw-design.md`, and
-`docs/specs/2026-06-25-unsloth-local-listing-and-bench-backend-identity-design.md`.
+`docs/specs/2026-06-24-unsloth-studio-provider-and-bpw-design.md`,
+`docs/specs/2026-06-25-unsloth-local-listing-and-bench-backend-identity-design.md`,
+and `docs/specs/2026-06-26-llama-server-provider-design.md`.

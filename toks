@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """toks - list local models with cached tokens/sec and bits/weight columns.
 
-Backends: Ollama, LM Studio, mlx-lm, and Unsloth Studio. Single-file,
-standard-library only. See
+Backends: Ollama, LM Studio, mlx-lm, Unsloth Studio, and llama.cpp server.
+Single-file, standard-library only. See
 docs/superpowers/specs/2026-05-31-toks-lmstudio-provider-design.md
 docs/superpowers/specs/2026-06-06-mlx-provider-design.md
 docs/specs/2026-06-24-unsloth-studio-provider-and-bpw-design.md
 docs/specs/2026-06-25-unsloth-local-listing-and-bench-backend-identity-design.md
+docs/specs/2026-06-26-llama-server-provider-design.md
 """
 import argparse
 import concurrent.futures
@@ -27,6 +28,7 @@ DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
 DEFAULT_LMSTUDIO_URL = "http://localhost:1234"
 DEFAULT_MLX_URL = "http://localhost:8080"
 DEFAULT_UNSLOTH_URL = "http://127.0.0.1:8888"
+DEFAULT_LLAMA_URL = "http://127.0.0.1:11435"
 DEFAULT_PROMPT = "Write one concise paragraph about local language models."
 DEFAULT_MAX_TOKENS = 128
 
@@ -813,6 +815,35 @@ def _snapshot_modified_at(rec, ref):
         pass
 
 
+def apply_gguf_meta(rec, gguf_path):
+    """Backfill fmt/quant/ctx/MoE/exact-params and size from a model's main GGUF.
+
+    Sets rec.size_bytes from the GGUF file and, when its header parses, fmt/quant/
+    ctx_max/moe/param_count/param_estimated and the MoE-aware params string (exact,
+    summed from the tensor table). Does NOT touch modified_at -- each caller sets
+    that from its own source (HF ref mtime vs. the GGUF's own mtime). Returns True
+    when the header parsed; False otherwise (size may still have been set).
+    """
+    try:
+        rec.size_bytes = gguf_path.stat().st_size
+    except OSError:
+        pass
+    meta = read_gguf_meta(gguf_path)
+    if not meta:
+        return False
+    rec.fmt = "gguf"
+    if meta["quant"]:
+        rec.quant = meta["quant"]
+    if meta["ctx"]:
+        rec.ctx_max = meta["ctx"]
+    expert_count = meta["expert_count"]
+    rec.moe = bool(isinstance(expert_count, int) and expert_count > 1)
+    rec.param_count = meta["param_count"]
+    rec.param_estimated = False      # exact, summed from the tensor table
+    rec.params = human_params(meta["param_count"], expert_count, meta["expert_used"])
+    return True
+
+
 def unsloth_enrich(records, hub_root):
     """Backfill size/quant/params/ctx/MoE from each model's cached weights.
 
@@ -828,25 +859,8 @@ def unsloth_enrich(records, hub_root):
             continue
         main = select_main_gguf(snapshot)
         if main is not None:
-            try:
-                rec.size_bytes = main.stat().st_size
-            except OSError:
-                pass
             _snapshot_modified_at(rec, ref)
-            meta = read_gguf_meta(main)
-            if not meta:
-                continue
-            rec.fmt = "gguf"
-            if meta["quant"]:
-                rec.quant = meta["quant"]
-            if meta["ctx"]:
-                rec.ctx_max = meta["ctx"]
-            expert_count = meta["expert_count"]
-            rec.moe = bool(isinstance(expert_count, int) and expert_count > 1)
-            rec.param_count = meta["param_count"]
-            rec.param_estimated = False      # exact, summed from the tensor table
-            rec.params = human_params(
-                meta["param_count"], expert_count, meta["expert_used"])
+            apply_gguf_meta(rec, main)
             continue
         # No GGUF -> an MLX/safetensors build (e.g. an mlx-community repo listed
         # for cross-runtime comparison): enrich from config.json, size-derived.
@@ -864,6 +878,83 @@ def unsloth_enrich(records, hub_root):
             pass
         _snapshot_modified_at(rec, ref)
         _apply_safetensors_config(rec, config)
+
+
+# --- llama.cpp server provider parsing (llama-server /v1/models + /props) -----
+
+
+def llama_parse_models(payload):
+    """Parse a GET /v1/models response from llama-server into ModelRecords.
+
+    llama-server returns both an Ollama-style `models` array and an OpenAI-style
+    `data` array; we read `data`, whose `meta` block already carries an exact
+    param count, on-disk size, and context lengths (so SIZE/PARAMS/BPW/CTX are
+    populated even over a network). The quant the BPW/TAG column wants is *not*
+    in `meta`; it comes from the GGUF, backfilled by llama_enrich when local.
+    Format is always gguf -- llama-server serves GGUF only.
+    """
+    data = (payload or {}).get("data")
+    if not isinstance(data, list):
+        return []
+    records = []
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        model_id = item.get("id")
+        if not model_id:
+            continue
+        rec = ModelRecord(provider="llama", name=model_id, fmt="gguf",
+                          benchmarkable=True, raw=item)
+        meta = item.get("meta")
+        if isinstance(meta, dict):
+            n_params = meta.get("n_params")
+            if isinstance(n_params, int) and n_params > 0:
+                rec.param_count = n_params
+                rec.param_estimated = False     # server-reported, exact
+                rec.params = human_params(n_params, None, None)
+            size = meta.get("size")
+            if isinstance(size, (int, float)) and size > 0:
+                rec.size_bytes = size
+            n_ctx = meta.get("n_ctx")
+            if isinstance(n_ctx, int) and n_ctx > 0:
+                rec.ctx_loaded = n_ctx          # running context
+            n_ctx_train = meta.get("n_ctx_train")
+            if isinstance(n_ctx_train, int) and n_ctx_train > 0:
+                rec.ctx_max = n_ctx_train       # trained max
+        records.append(rec)
+    return records
+
+
+def llama_enrich(records, props):
+    """Backfill quant/MoE/exact-params/ctx from the loaded model's GGUF.
+
+    llama-server's /props names the on-disk GGUF (model_path); reading its header
+    yields the quant the listing omits (the BPW/TAG source) plus exact params and
+    the MoE flag. Targets the record whose name matches model_alias, or the sole
+    record when there is one. Off-box the path won't exist, so this is a silent
+    no-op; absent or malformed files leave the record untouched -- never raises.
+    """
+    if not isinstance(props, dict):
+        return
+    model_path = props.get("model_path")
+    if not isinstance(model_path, str) or not model_path:
+        return
+    alias = props.get("model_alias")
+    target = next((r for r in records if r.name == alias), None)
+    if target is None and len(records) == 1:
+        target = records[0]
+    if target is None:
+        return
+    path = Path(model_path)
+    if path.suffix.lower() != ".gguf" or not path.is_file():
+        return
+    if apply_gguf_meta(target, path):
+        try:
+            mtime = path.stat().st_mtime
+            target.modified_at = datetime.fromtimestamp(
+                mtime, tz=timezone.utc).isoformat()
+        except OSError:
+            pass
 
 
 def parse_llamacpp_timings(response):
@@ -888,13 +979,18 @@ def parse_llamacpp_timings(response):
                        system_fingerprint=(response or {}).get("system_fingerprint"))
 
 
-def bench_unsloth_sse(lines, start, clock=time.monotonic):
-    """Time an Unsloth Studio completion stream in a single live pass.
+def bench_llamacpp_sse(lines, start, clock=time.monotonic, otherwise="unknown"):
+    """Time a llama.cpp-server completion stream in a single live pass.
 
     Prefers the server's own llama.cpp `timings` (the first chunk to carry one);
     falls back to client-side timing (TTFT = first content chunk, throughput over
     the first->last interval) if a build ever omits timings. Returns None when
     nothing measurable arrived.
+
+    Shared by the `unsloth` and `llama` providers. `otherwise` is the engine the
+    fallback records when a stream carries neither timings nor a build fingerprint:
+    multi-runtime Studio settles for 'unknown', a plain llama-server for 'llamacpp'
+    (in practice unreachable -- llama.cpp always emits timings).
     """
     first = last = None
     chunk_count = 0
@@ -940,11 +1036,12 @@ def bench_unsloth_sse(lines, start, clock=time.monotonic):
     tokens = completion_tokens or chunk_count
     if tokens < 2:
         return None
-    # No llama.cpp timings: Studio served via another runtime (transformers/mlx).
+    # No llama.cpp timings: served via another runtime (transformers/mlx) or a
+    # build that omits them; the caller's `otherwise` names the expected engine.
     return BenchResult(
         (tokens - 1) / (last - first), first - start, tps_source="client_timed",
         observed_backend=_classify_streamed_backend(fingerprint, False,
-                                                     otherwise="unknown"),
+                                                     otherwise=otherwise),
         system_fingerprint=fingerprint)
 
 
@@ -966,7 +1063,7 @@ def tag_cell(rec):
 
 # --- benchmark cache --------------------------------------------------------
 
-_PROVIDER_PREFIXES = ("ollama:", "lmstudio:", "mlx:", "unsloth:")
+_PROVIDER_PREFIXES = ("ollama:", "lmstudio:", "mlx:", "unsloth:", "llama:")
 
 
 def cache_key(rec):
@@ -1137,6 +1234,15 @@ def unsloth_url():
 
 def unsloth_headers():
     token = os.environ.get("UNSLOTH_API_KEY")
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
+def llama_url():
+    return normalize_host(os.environ.get("LLAMA_URL"), DEFAULT_LLAMA_URL)
+
+
+def llama_headers():
+    token = os.environ.get("LLAMA_API_KEY")
     return {"Authorization": f"Bearer {token}"} if token else {}
 
 
@@ -1409,7 +1515,56 @@ class UnslothProvider:
         start = time.monotonic()
         lines = http_sse(f"{self.host}/v1/completions", payload, BENCH_TIMEOUT,
                          headers=self.headers)
-        return bench_unsloth_sse(lines, start)
+        return bench_llamacpp_sse(lines, start)
+
+
+class LlamaProvider:
+    name = "llama"
+    expected_backend = "llamacpp"
+
+    def __init__(self):
+        self.host = llama_url()
+        self.headers = llama_headers()
+
+    def list_models(self):
+        data = http_json(f"{self.host}/v1/models", headers=self.headers,
+                         timeout=LIST_TIMEOUT)
+        records = llama_parse_models(data)
+        # /v1/models' meta gives size/params/ctx even remotely; the quant the
+        # BPW/TAG column wants lives only in the GGUF, whose path /props reports
+        # and which is readable when the server runs on this machine.
+        if records and is_local_host(self.host):
+            try:
+                props = http_json(f"{self.host}/props", headers=self.headers,
+                                  timeout=INFO_TIMEOUT)
+            except RuntimeError:
+                props = {}
+            llama_enrich(records, props)
+        return records
+
+    def benchmark(self, rec, prompt, max_tokens):
+        # A 1-token warmup absorbs any load time (the model is usually already
+        # loaded), then we read the server's llama.cpp `timings` from the stream,
+        # falling back to client-side timing. Auth token rides on every request.
+        warmup = {"model": rec.name, "prompt": prompt, "max_tokens": 1,
+                  "stream": False, "temperature": 0}
+        try:
+            http_json(f"{self.host}/v1/completions", payload=warmup,
+                      headers=self.headers, timeout=BENCH_TIMEOUT)
+        except RuntimeError:
+            pass
+        payload = {
+            "model": rec.name,
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "temperature": 0,
+        }
+        start = time.monotonic()
+        lines = http_sse(f"{self.host}/v1/completions", payload, BENCH_TIMEOUT,
+                         headers=self.headers)
+        return bench_llamacpp_sse(lines, start, otherwise="llamacpp")
 
 
 def select_providers(choice):
@@ -1418,6 +1573,7 @@ def select_providers(choice):
         "lmstudio": LMStudioProvider,
         "mlx": MlxProvider,
         "unsloth": UnslothProvider,
+        "llama": LlamaProvider,
     }
     if choice in providers:
         return [providers[choice]()]
@@ -1554,12 +1710,12 @@ def run_benchmarks(records, active, cache):
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="List local models (Ollama + LM Studio + mlx-lm + Unsloth Studio) "
-                    "with cached tokens/sec and bits/weight columns."
+        description="List local models (Ollama + LM Studio + mlx-lm + Unsloth Studio "
+                    "+ llama.cpp server) with cached tokens/sec and bits/weight columns."
     )
     parser.add_argument(
         "--provider",
-        choices=("ollama", "lmstudio", "mlx", "unsloth", "all"),
+        choices=("ollama", "lmstudio", "mlx", "unsloth", "llama", "all"),
         default="all",
         help="which backend(s) to query (default: all reachable)",
     )

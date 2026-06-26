@@ -472,7 +472,7 @@ class MlxWiringTests(unittest.TestCase):
     def test_select_providers_all_includes_mlx(self):
         providers = toks.select_providers("all")
         self.assertEqual([p.name for p in providers],
-                         ["ollama", "lmstudio", "mlx", "unsloth"])
+                         ["ollama", "lmstudio", "mlx", "unsloth", "llama"])
 
     def test_provider_flag_accepts_mlx(self):
         self.assertEqual(toks.parse_args(["--provider", "mlx"]).provider, "mlx")
@@ -1213,7 +1213,7 @@ class LlamaCppTimingsTests(unittest.TestCase):
         self.assertIsNone(result.time_to_first_token)
 
 
-class BenchUnslothSseTests(unittest.TestCase):
+class BenchLlamacppSseTests(unittest.TestCase):
     CHUNKS = [
         {"choices": [{"index": 0, "text": "Hello"}]},
         {"choices": [{"index": 0, "text": " world"}]},
@@ -1224,18 +1224,32 @@ class BenchUnslothSseTests(unittest.TestCase):
                  "usage": {"completion_tokens": 50},
                  "timings": {"predicted_per_second": 42.0, "prompt_ms": 200.0}}
         lines = _sse(*self.CHUNKS, final)
-        result = toks.bench_unsloth_sse(lines, start=0.0,
-                                        clock=FakeClock([1.0, 2.0]))
+        result = toks.bench_llamacpp_sse(lines, start=0.0,
+                                         clock=FakeClock([1.0, 2.0]))
         self.assertAlmostEqual(result.tokens_per_second, 42.0)
         self.assertAlmostEqual(result.time_to_first_token, 0.2)
 
     def test_falls_back_to_client_timing(self):
         usage = {"choices": [], "usage": {"completion_tokens": 12}}
         lines = _sse(*self.CHUNKS, usage)
-        result = toks.bench_unsloth_sse(lines, start=0.5,
-                                        clock=FakeClock([1.0, 3.0]))
+        result = toks.bench_llamacpp_sse(lines, start=0.5,
+                                         clock=FakeClock([1.0, 3.0]))
         self.assertAlmostEqual(result.tokens_per_second, 5.5)   # (12-1)/2.0
         self.assertAlmostEqual(result.time_to_first_token, 0.5)
+
+    def test_otherwise_defaults_to_unknown_for_unsloth(self):
+        # No timings, no fingerprint: the unsloth caller's default labels it unknown.
+        lines = _sse(*self.CHUNKS, {"choices": [], "usage": {"completion_tokens": 6}})
+        r = toks.bench_llamacpp_sse(lines, start=0.0, clock=FakeClock([1.0, 2.0]))
+        self.assertEqual(r.observed_backend, "unknown")
+
+    def test_otherwise_llamacpp_for_plain_llama_server(self):
+        # A plain llama-server passes otherwise="llamacpp" for the (unreachable in
+        # practice) no-timings fallback.
+        lines = _sse(*self.CHUNKS, {"choices": [], "usage": {"completion_tokens": 6}})
+        r = toks.bench_llamacpp_sse(lines, start=0.0, clock=FakeClock([1.0, 2.0]),
+                                    otherwise="llamacpp")
+        self.assertEqual(r.observed_backend, "llamacpp")
 
 
 class ObservedBackendTests(unittest.TestCase):
@@ -1291,7 +1305,7 @@ class ObservedBackendTests(unittest.TestCase):
         # No llama.cpp timings: Studio served via another runtime (transformers).
         lines = _sse({"choices": [{"text": "a"}]}, {"choices": [{"text": "b"}]},
                      {"choices": [], "usage": {"completion_tokens": 6}})
-        r = toks.bench_unsloth_sse(lines, start=0.0, clock=FakeClock([1.0, 2.0]))
+        r = toks.bench_llamacpp_sse(lines, start=0.0, clock=FakeClock([1.0, 2.0]))
         self.assertEqual((r.tps_source, r.observed_backend),
                          ("client_timed", "unknown"))
 
@@ -1365,6 +1379,148 @@ class UnslothWiringTests(unittest.TestCase):
                              {"Authorization": "Bearer sk-zzz"})
         with mock.patch.dict(toks.os.environ, {}, clear=True):
             self.assertEqual(toks.unsloth_headers(), {})
+
+
+# ---- llama.cpp server listing / enrich / wiring ----------------------------
+
+# Anonymized capture of llama-server GET /v1/models: we read the OpenAI-style
+# `data` array, whose `meta` block carries exact params, on-disk size, and ctx.
+LLAMA_MODELS = {"object": "list", "data": [
+    {"id": "acme/demo-31B-it-GGUF", "owned_by": "llamacpp",
+     "meta": {"n_ctx": 131072, "n_ctx_train": 262144,
+              "n_params": 30_000_000_000, "size": 17_000_000_000}},
+]}
+
+
+class LlamaListingTests(unittest.TestCase):
+    def test_parses_data_into_records(self):
+        rec = toks.llama_parse_models(LLAMA_MODELS)[0]
+        self.assertEqual((rec.provider, rec.name, rec.fmt),
+                         ("llama", "acme/demo-31B-it-GGUF", "gguf"))
+        self.assertTrue(rec.benchmarkable)
+
+    def test_meta_populates_params_size_and_ctx(self):
+        rec = toks.llama_parse_models(LLAMA_MODELS)[0]
+        self.assertEqual(rec.param_count, 30_000_000_000)
+        self.assertFalse(rec.param_estimated)             # server-reported, exact
+        self.assertEqual(rec.params, toks.human_params(30_000_000_000, None, None))
+        self.assertFalse(rec.params.startswith("~"))
+        self.assertEqual(rec.size_bytes, 17_000_000_000)
+        self.assertEqual(rec.ctx_loaded, 131072)          # running ctx
+        self.assertEqual(rec.ctx_max, 262144)             # trained max
+
+    def test_quant_absent_until_enriched(self):
+        rec = toks.llama_parse_models(LLAMA_MODELS)[0]
+        self.assertEqual(rec.quant, "-")                  # only the GGUF has it
+
+    def test_missing_or_malformed_meta_leaves_defaults(self):
+        rec = toks.llama_parse_models({"data": [{"id": "x"}]})[0]
+        self.assertEqual((rec.name, rec.fmt), ("x", "gguf"))
+        self.assertIsNone(rec.param_count)
+        self.assertIsNone(rec.size_bytes)
+        self.assertIsNone(rec.ctx_loaded)
+
+    def test_empty_or_missing_data_yields_no_records(self):
+        self.assertEqual(toks.llama_parse_models({}), [])
+        self.assertEqual(toks.llama_parse_models({"data": []}), [])
+        self.assertEqual(toks.llama_parse_models({"data": "nope"}), [])
+        self.assertEqual(toks.llama_parse_models({"data": [{"no": "id"}]}), [])
+
+
+class LlamaEnrichmentTests(unittest.TestCase):
+    def _gguf_file(self, **kw):
+        tmp = tempfile.NamedTemporaryFile(suffix=".gguf", delete=False)
+        tmp.write(_build_gguf(**kw))
+        tmp.close()
+        self.addCleanup(lambda: pathlib.Path(tmp.name).unlink(missing_ok=True))
+        return tmp.name
+
+    def test_backfills_quant_params_ctx_and_modified(self):
+        path = self._gguf_file(arch="gemma4", file_type=15, ctx=262144,
+                               tensors=[("tok", [1000, 64]), ("out", [64, 1000])])
+        recs = toks.llama_parse_models(LLAMA_MODELS)
+        props = {"model_alias": "acme/demo-31B-it-GGUF", "model_path": path}
+        toks.llama_enrich(recs, props)
+        rec = recs[0]
+        self.assertEqual(rec.quant, "Q4_K_M")             # only the GGUF supplies it
+        self.assertEqual(rec.ctx_max, 262144)
+        self.assertEqual(rec.param_count, 1000 * 64 + 64 * 1000)  # GGUF refines meta
+        self.assertFalse(rec.param_estimated)
+        self.assertFalse(rec.moe)
+        self.assertEqual(rec.size_bytes, pathlib.Path(path).stat().st_size)
+        self.assertIsNotNone(rec.modified_at)
+
+    def test_moe_detected_from_gguf(self):
+        path = self._gguf_file(expert_count=8)
+        recs = toks.llama_parse_models(LLAMA_MODELS)
+        toks.llama_enrich(recs, {"model_alias": "acme/demo-31B-it-GGUF",
+                                 "model_path": path})
+        self.assertTrue(recs[0].moe)
+
+    def test_alias_selects_the_matching_record(self):
+        path = self._gguf_file()
+        recs = [toks.ModelRecord("llama", "other/model"),
+                toks.ModelRecord("llama", "acme/demo-31B-it-GGUF")]
+        toks.llama_enrich(recs, {"model_alias": "acme/demo-31B-it-GGUF",
+                                 "model_path": path})
+        self.assertEqual(recs[0].quant, "-")              # untouched
+        self.assertEqual(recs[1].fmt, "gguf")             # the loaded one
+
+    def test_single_record_fallback_without_alias_match(self):
+        path = self._gguf_file()
+        recs = toks.llama_parse_models(LLAMA_MODELS)
+        toks.llama_enrich(recs, {"model_path": path})     # no alias
+        self.assertEqual(recs[0].fmt, "gguf")
+
+    def test_no_alias_match_with_several_records_is_noop(self):
+        path = self._gguf_file()
+        recs = [toks.ModelRecord("llama", "a"), toks.ModelRecord("llama", "b")]
+        toks.llama_enrich(recs, {"model_alias": "c", "model_path": path})
+        self.assertTrue(all(r.size_bytes is None for r in recs))
+
+    def test_missing_path_and_file_and_props_are_noops(self):
+        recs = toks.llama_parse_models(LLAMA_MODELS)
+        toks.llama_enrich(recs, {})                              # no model_path
+        toks.llama_enrich(recs, "nope")                         # not a dict
+        toks.llama_enrich(recs, {"model_alias": "acme/demo-31B-it-GGUF",
+                                 "model_path": "/no/such/file.gguf"})
+        toks.llama_enrich(recs, {"model_alias": "acme/demo-31B-it-GGUF",
+                                 "model_path": __file__})        # exists, not .gguf
+        self.assertEqual(recs[0].quant, "-")               # never enriched
+
+
+class LlamaWiringTests(unittest.TestCase):
+    def test_select_providers_llama(self):
+        self.assertEqual([p.name for p in toks.select_providers("llama")],
+                         ["llama"])
+
+    def test_provider_flag_accepts_llama(self):
+        self.assertEqual(toks.parse_args(["--provider", "llama"]).provider, "llama")
+
+    def test_default_url_and_cache_prefix(self):
+        self.assertIn("llama:", toks._PROVIDER_PREFIXES)
+        with mock.patch.dict(toks.os.environ, {}, clear=True):
+            self.assertEqual(toks.llama_url(), "http://127.0.0.1:11435")
+
+    def test_url_env_override(self):
+        with mock.patch.dict(toks.os.environ, {"LLAMA_URL": "host:9999"},
+                             clear=True):
+            self.assertEqual(toks.llama_url(), "http://host:9999")
+
+    def test_headers_from_api_key(self):
+        with mock.patch.dict(toks.os.environ, {"LLAMA_API_KEY": "sk-zzz"},
+                             clear=True):
+            self.assertEqual(toks.llama_headers(),
+                             {"Authorization": "Bearer sk-zzz"})
+        with mock.patch.dict(toks.os.environ, {}, clear=True):
+            self.assertEqual(toks.llama_headers(), {})
+
+    def test_cache_key_and_migration_idempotent(self):
+        rec = toks.ModelRecord("llama", "acme/demo-31B-it-GGUF")
+        key = toks.cache_key(rec)
+        self.assertEqual(key, "llama:acme/demo-31B-it-GGUF")
+        cache = {key: {"provider": "llama", "tokens_per_second": 12.3}}
+        self.assertEqual(toks.migrate_cache(cache), cache)   # already namespaced
 
 
 # ---- .env loader (read-only) -----------------------------------------------
