@@ -3,8 +3,8 @@
 
 Backends: Ollama, LM Studio, mlx-lm, Unsloth Studio, and llama.cpp server.
 Single-file, standard-library only. See
-docs/superpowers/specs/2026-05-31-toks-lmstudio-provider-design.md
-docs/superpowers/specs/2026-06-06-mlx-provider-design.md
+docs/specs/2026-05-31-toks-lmstudio-provider-design.md
+docs/specs/2026-06-06-mlx-provider-design.md
 docs/specs/2026-06-24-unsloth-studio-provider-and-bpw-design.md
 docs/specs/2026-06-25-unsloth-local-listing-and-bench-backend-identity-design.md
 docs/specs/2026-06-26-llama-server-provider-design.md

@@ -3,7 +3,8 @@
 List local LLMs across backends — **Ollama**, **LM Studio**, **mlx-lm**
 (`mlx_lm.server`), **Unsloth Studio**, and a **llama.cpp server**
 (`llama-server`) — in one table, ranked by cached tokens/sec and annotated with
-effective **bits/weight**. Single file, Python 3 standard library only.
+effective **bits/weight**. Single file, Python 3 standard library only — no
+dependencies, no `pip install`.
 
 ```
 $ toks
@@ -25,6 +26,29 @@ MLX `nvfp4` build at **5.18** (FP4 weights still carry FP8 block scales). BPW is
 exact when the parameter count is known precisely (Ollama, Unsloth's GGUF
 header); a leading `~` marks counts estimated from file size. `SIZE` is binary
 (GiB), so the GGUF's 18.3 GB on disk shows as `17.1 GB` while `BPW` uses raw bytes.
+
+## Requirements
+
+- **Python 3.10+** — standard library only. No third-party packages.
+- At least one of the supported backends running and reachable (see
+  [Configuration](#configuration) and the per-backend prerequisites below).
+
+## Install
+
+`toks` is a single self-contained script. Put it anywhere on your `PATH`:
+
+```
+curl -fsSL https://raw.githubusercontent.com/larskluge/toks/main/toks -o ~/.local/bin/toks
+chmod +x ~/.local/bin/toks
+toks
+```
+
+Or clone and run it in place:
+
+```
+git clone https://github.com/larskluge/toks
+./toks/toks
+```
 
 ## Usage
 
@@ -164,13 +188,16 @@ Studio and mlx-lm off, it behaves exactly like the original Ollama-only tool.
 ## Tests
 
 ```
-python3 -m unittest test_toks   # network-free unit tests
+python3 -m unittest test_toks   # 179 network-free unit tests
 ```
 
 ## Design
 
-See `docs/superpowers/specs/2026-05-31-toks-lmstudio-provider-design.md`,
-`docs/superpowers/specs/2026-06-06-mlx-provider-design.md`,
-`docs/specs/2026-06-24-unsloth-studio-provider-and-bpw-design.md`,
-`docs/specs/2026-06-25-unsloth-local-listing-and-bench-backend-identity-design.md`,
-and `docs/specs/2026-06-26-llama-server-provider-design.md`.
+Design notes live in [`docs/specs/`](docs/specs):
+
+- [`2026-05-31-toks-lmstudio-provider-design.md`](docs/specs/2026-05-31-toks-lmstudio-provider-design.md) — multi-provider listing + LM Studio
+- [`2026-06-06-cli-flags-cleanup-design.md`](docs/specs/2026-06-06-cli-flags-cleanup-design.md) — folding the bench flags into `--bench`
+- [`2026-06-06-mlx-provider-design.md`](docs/specs/2026-06-06-mlx-provider-design.md) — mlx-lm provider
+- [`2026-06-24-unsloth-studio-provider-and-bpw-design.md`](docs/specs/2026-06-24-unsloth-studio-provider-and-bpw-design.md) — Unsloth Studio provider + the BPW column
+- [`2026-06-25-unsloth-local-listing-and-bench-backend-identity-design.md`](docs/specs/2026-06-25-unsloth-local-listing-and-bench-backend-identity-design.md) — local listing + observed-backend identity
+- [`2026-06-26-llama-server-provider-design.md`](docs/specs/2026-06-26-llama-server-provider-design.md) — llama.cpp `llama-server` provider
