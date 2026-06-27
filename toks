@@ -13,6 +13,8 @@ import argparse
 import concurrent.futures
 import json
 import os
+import secrets
+import statistics
 import struct
 import sys
 import time
@@ -30,7 +32,21 @@ DEFAULT_MLX_URL = "http://localhost:8080"
 DEFAULT_UNSLOTH_URL = "http://127.0.0.1:8888"
 DEFAULT_LLAMA_URL = "http://127.0.0.1:11435"
 DEFAULT_PROMPT = "Write one concise paragraph about local language models."
-DEFAULT_MAX_TOKENS = 128
+DEFAULT_MAX_TOKENS = 256
+DEFAULT_SAMPLES = 3          # independent nonced runs; cache the median + spread
+
+# A working per-run nonce forces the timed prompt's KV prefix to be unique, so a
+# llama.cpp server should report cache_n≈0. Allow a few tokens of slack (a shared
+# BOS, the bracketed nonce) before warning that an external cache replayed it.
+CACHE_N_BUDGET = 8
+
+# Spec-decode acceptance is content-dependent (predictable code accepts far more
+# draft tokens than freeform prose), so throughput can differ ~2x between them.
+# The opt-in --bench-suite measures both kinds; the default stays prose-only.
+CODE_PROMPT = ("Write a complete, thread-safe LRU cache in Python with O(1) get "
+               "and put, per-entry TTL expiry, type hints, and docstrings. "
+               "Output only the code.")
+BENCH_PROMPTS = {"prose": DEFAULT_PROMPT, "code": CODE_PROMPT}
 
 AVAIL_TIMEOUT = 5      # reachability probe
 LIST_TIMEOUT = 10      # listing (remote LM Studio may be slower than local)
@@ -76,6 +92,9 @@ class BenchResult:
     observed_backend: str | None = None  # engine inferred from the response:
                                          # ollama|lmstudio|llamacpp|mlx_lm|unknown
     system_fingerprint: str | None = None
+    draft_n: int | None = None           # speculative tokens proposed (MTP/ngram)
+    draft_n_accepted: int | None = None  # of those, verified/kept
+    cache_n: int | None = None           # tokens served from the KV prefix cache
 
 
 def _looks_llamacpp_fingerprint(fingerprint):
@@ -173,6 +192,15 @@ def parse_lmstudio_bench(response):
     stats = (response or {}).get("stats")
     if not isinstance(stats, dict):
         return None
+    # A degenerate run (model emits 1 token then EOS) makes LM Studio divide ~1
+    # token by ~0s and report a nonsense rate (seen: 142857 tok/s). The streamed
+    # paths already require >=2 tokens; reject it here too so a non-representative
+    # number never reaches the cache.
+    usage = (response or {}).get("usage")
+    if isinstance(usage, dict):
+        completed = usage.get("completion_tokens")
+        if isinstance(completed, int) and completed < 2:
+            return None
     tps = stats.get("tokens_per_second")
     if not isinstance(tps, (int, float)) or tps <= 0:
         return None
@@ -191,7 +219,10 @@ def parse_ollama_bench(response):
     eval_duration = response.get("eval_duration")
     if not isinstance(eval_count, (int, float)) or not isinstance(eval_duration, (int, float)):
         return None
-    if eval_count <= 0 or eval_duration <= 0:
+    # Need >=2 generated tokens for a meaningful rate: a 1-token run (immediate
+    # EOS) over a near-zero eval_duration yields a nonsense throughput (matches
+    # the streamed paths' tokens<2 guard).
+    if eval_count < 2 or eval_duration <= 0:
         return None
     tps = float(eval_count) / (float(eval_duration) / 1_000_000_000.0)
     # Time to first token = model load + prompt evaluation, in seconds.
@@ -579,7 +610,7 @@ def bench_from_sse(lines, start, clock=time.monotonic):
     chunk_count = 0
     completion_tokens = None
     fingerprint = None
-    saw_timings = False
+    timings_block = None
     for raw in lines:
         line = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
         line = line.strip()
@@ -595,7 +626,7 @@ def bench_from_sse(lines, start, clock=time.monotonic):
         if event.get("system_fingerprint"):
             fingerprint = event["system_fingerprint"]
         if isinstance(event.get("timings"), dict):
-            saw_timings = True
+            timings_block = event["timings"]
         usage = event.get("usage")
         if isinstance(usage, dict):
             tokens = usage.get("completion_tokens")
@@ -619,9 +650,10 @@ def bench_from_sse(lines, start, clock=time.monotonic):
         return None
     return BenchResult(
         (tokens - 1) / (last - first), first - start, tps_source="client_timed",
-        observed_backend=_classify_streamed_backend(fingerprint, saw_timings,
-                                                     otherwise="mlx_lm"),
-        system_fingerprint=fingerprint)
+        observed_backend=_classify_streamed_backend(
+            fingerprint, timings_block is not None, otherwise="mlx_lm"),
+        system_fingerprint=fingerprint,
+        **(_draft_stats(timings_block) if timings_block is not None else {}))
 
 
 # --- Unsloth Studio provider parsing (llama.cpp server) ----------------------
@@ -996,12 +1028,28 @@ def served_model_matches(requested, served):
     return req.rsplit("/", 1)[-1] == srv.rsplit("/", 1)[-1]
 
 
+def _opt_int(value):
+    """An int as-is (0 preserved), else None -- keeps absent distinct from zero."""
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _draft_stats(timings):
+    """Lift the speculative-decode + prefix-cache counters from a timings dict."""
+    return {
+        "draft_n": _opt_int(timings.get("draft_n")),
+        "draft_n_accepted": _opt_int(timings.get("draft_n_accepted")),
+        "cache_n": _opt_int(timings.get("cache_n")),
+    }
+
+
 def parse_llamacpp_timings(response):
     """Read server-measured throughput from a llama.cpp `timings` block.
 
     Unsloth Studio (a llama.cpp server) reports predicted_per_second and
     prompt_ms in the stream's final chunk -- accurate even over a network, so we
-    prefer it to client-side timing. Returns None when absent or non-positive.
+    prefer it to client-side timing. The same block carries the speculative-decode
+    counters (draft_n / draft_n_accepted) and cache_n (prefix-cache hits), which we
+    lift to explain the throughput. Returns None when absent or non-positive.
     """
     timings = (response or {}).get("timings")
     if not isinstance(timings, dict):
@@ -1015,7 +1063,8 @@ def parse_llamacpp_timings(response):
         ttft = float(prompt_ms) / 1000.0
     return BenchResult(float(tps), ttft, tps_source="llamacpp_timings",
                        observed_backend="llamacpp",
-                       system_fingerprint=(response or {}).get("system_fingerprint"))
+                       system_fingerprint=(response or {}).get("system_fingerprint"),
+                       **_draft_stats(timings))
 
 
 def bench_llamacpp_sse(lines, start, clock=time.monotonic, otherwise="unknown"):
@@ -1162,6 +1211,46 @@ def cached_ttft(cache, rec):
     return None
 
 
+def _acceptance(entry):
+    """Pooled speculative-decode acceptance for a cache entry, or None.
+
+    Returns draft_n_accepted / draft_n when both are present and draft_n > 0; a
+    non-speculating backend (no draft counters) yields None, rendered as '-'.
+    """
+    if not isinstance(entry, dict):
+        return None
+    drafted = entry.get("draft_n")
+    accepted = entry.get("draft_n_accepted")
+    if isinstance(drafted, int) and drafted > 0 and isinstance(accepted, (int, float)):
+        return accepted / drafted
+    return None
+
+
+def cached_acceptance(cache, rec):
+    return _acceptance(_cache_entry(cache, rec))
+
+
+def _cached_by_kind(cache, rec, kind):
+    """The nested per-kind aggregate (--bench-suite) for a record, or None."""
+    entry = _cache_entry(cache, rec)
+    bucket = entry.get("by_kind") if isinstance(entry, dict) else None
+    sub = bucket.get(kind) if isinstance(bucket, dict) else None
+    return sub if isinstance(sub, dict) else None
+
+
+def cached_kind_tps(cache, rec, kind):
+    sub = _cached_by_kind(cache, rec, kind)
+    if sub:
+        value = sub.get("tokens_per_second")
+        if isinstance(value, (int, float)) and value > 0:
+            return float(value)
+    return None
+
+
+def cached_kind_acceptance(cache, rec, kind):
+    return _acceptance(_cached_by_kind(cache, rec, kind))
+
+
 def tps_sort_key(cache, rec):
     tps = cached_tps(cache, rec)
     if tps is None:
@@ -1172,17 +1261,30 @@ def tps_sort_key(cache, rec):
 # --- table rendering --------------------------------------------------------
 
 HEADER = ["PROVIDER", "NAME", "SIZE", "TAG", "PARAMS", "BPW", "CTX", "TTFT",
-          "TOKENS/S", "MODIFIED"]
-RIGHT_ALIGN = {"SIZE", "PARAMS", "BPW", "CTX", "TTFT", "TOKENS/S"}
+          "TOKENS/S", "ACC%", "MODIFIED"]
+RIGHT_ALIGN = {"SIZE", "PARAMS", "BPW", "CTX", "TTFT", "TOKENS/S", "ACC%",
+               "CODE/S", "CODE%"}
+
+
+def _pct(value):
+    return f"{value * 100:.0f}%" if value is not None else "-"
 
 
 def build_rows(records, cache):
-    rows = [list(HEADER)]
+    # The code-spread columns only earn their width when a displayed model carries
+    # a --bench-suite result; otherwise they are omitted entirely (no empty churn).
+    show_code = any(_cached_by_kind(cache, rec, "code") for rec in records)
+    header = list(HEADER)
+    if show_code:
+        pos = header.index("ACC%") + 1
+        header[pos:pos] = ["CODE/S", "CODE%"]
+    rows = [header]
     for rec in records:
         tps = cached_tps(cache, rec)
         ttft = cached_ttft(cache, rec)
+        acc = cached_acceptance(cache, rec)
         ctx = rec.ctx_loaded or rec.ctx_max
-        rows.append([
+        row = [
             rec.provider,
             rec.name or "-",
             human_size(rec.size_bytes),
@@ -1192,8 +1294,14 @@ def build_rows(records, cache):
             human_ctx(ctx),
             f"{ttft:.2f}" if ttft else "-",
             f"{tps:.1f}" if tps else "-",
-            human_age(rec.modified_at) if rec.modified_at else "-",
-        ])
+            _pct(acc),
+        ]
+        if show_code:
+            code_tps = cached_kind_tps(cache, rec, "code")
+            row.append(f"{code_tps:.1f}" if code_tps else "-")
+            row.append(_pct(cached_kind_acceptance(cache, rec, "code")))
+        row.append(human_age(rec.modified_at) if rec.modified_at else "-")
+        rows.append(row)
     return rows
 
 
@@ -1728,8 +1836,78 @@ def select_bench_records(records, targets, cache):
     return selected, unknown
 
 
-def run_benchmarks(records, active, cache):
-    """Benchmark the given records in place; return True if the cache changed."""
+def nonce_prompt(prompt):
+    """Prefix a prompt with random bytes so no two timed runs share a KV prefix.
+
+    A leading nonce (not a suffix) is deliberate: llama.cpp's prefix cache keys on
+    the leading tokens, so a unique lead forces cache_n==0 and stops ngram-mod from
+    replaying a prior identical generation. The ~3-token nonce is negligible vs 256.
+    """
+    return f"[{secrets.token_hex(3)}] {prompt}"
+
+
+def aggregate_samples(results):
+    """Reduce N independent BenchResults to the cached median + spread.
+
+    Throughput is the median of the per-run rates (tps_min/tps_max record the
+    spread); TTFT the median of the runs that reported one. Speculative-decode
+    acceptance is *pooled* (Sigma accepted / Sigma drafted, surfaced as the two
+    counters) -- the statistically correct aggregate, not a mean of per-run ratios.
+    """
+    tps = [r.tokens_per_second for r in results]
+    ttfts = [r.time_to_first_token for r in results
+             if r.time_to_first_token is not None]
+    drafted = sum(r.draft_n or 0 for r in results)
+    accepted = sum(r.draft_n_accepted or 0 for r in results)
+    return {
+        "tokens_per_second": statistics.median(tps),
+        "tps_min": min(tps),
+        "tps_max": max(tps),
+        "samples": len(tps),
+        "time_to_first_token": statistics.median(ttfts) if ttfts else None,
+        "draft_n": drafted or None,
+        "draft_n_accepted": accepted if drafted else None,
+    }
+
+
+def _bench_samples(provider, rec, base_prompt, samples):
+    """Run `samples` nonced benchmarks of one prompt kind; return the BenchResults.
+
+    Each run carries a fresh nonce so no two timed prompts share a KV prefix (a
+    single sample varies 20-30%, and a cached/speculated backend far more). A
+    sample whose cache_n exceeds the prefix budget is flagged -- the nonce failed
+    or an external cache replayed the prompt -- but still kept; the warning, not
+    suppression, is the contract. Stops at the first failed or empty sample.
+    """
+    results = []
+    for _ in range(samples):
+        try:
+            result = provider.benchmark(rec, nonce_prompt(base_prompt),
+                                        DEFAULT_MAX_TOKENS)
+        except RuntimeError as exc:
+            print(f"warning: benchmark failed for {rec.name}: {exc}", file=sys.stderr)
+            break
+        if result is None:
+            print(f"warning: no throughput stats returned for {rec.name}", file=sys.stderr)
+            break
+        results.append(result)
+        if result.cache_n is not None and result.cache_n > CACHE_N_BUDGET:
+            print(f"warning: {rec.name}: timed sample served cache_n="
+                  f"{result.cache_n} tokens from the prefix cache; throughput "
+                  "may be inflated", file=sys.stderr)
+    return results
+
+
+def run_benchmarks(records, active, cache, samples=DEFAULT_SAMPLES, kinds=None):
+    """Benchmark the given records in place; return True if the cache changed.
+
+    Each record is measured over the prompt `kinds` (default prose only; the suite
+    adds code), with `samples` nonced runs per kind aggregated to a median + spread.
+    The cached top-level throughput tracks the primary (prose) kind so legacy
+    readers are unaffected; a multi-kind run also nests every kind under `by_kind`.
+    """
+    kinds = kinds or ["prose"]
+    primary = kinds[0]
     changed = False
     for rec in records:
         if not rec.benchmarkable:
@@ -1739,17 +1917,17 @@ def run_benchmarks(records, active, cache):
         if provider is None:
             continue
         print(f"benchmarking {rec.provider}/{rec.name}...", file=sys.stderr)
-        try:
-            result = provider.benchmark(rec, DEFAULT_PROMPT, DEFAULT_MAX_TOKENS)
-        except RuntimeError as exc:
-            print(f"warning: benchmark failed for {rec.name}: {exc}", file=sys.stderr)
-            continue
-        if result is None:
-            print(f"warning: no throughput stats returned for {rec.name}", file=sys.stderr)
-            continue
+        measured = {}       # kind -> (aggregate dict, representative BenchResult)
+        for kind in kinds:
+            results = _bench_samples(provider, rec, BENCH_PROMPTS[kind], samples)
+            if results:
+                measured[kind] = (aggregate_samples(results), results[0])
+        if primary not in measured:
+            continue        # no trustworthy number for the headline kind
+        agg, rep = measured[primary]
         host = getattr(provider, "host", None)
         expected = getattr(provider, "expected_backend", None)
-        observed = result.observed_backend
+        observed = rep.observed_backend
         # The cached number is only trustworthy if we know who served it. The
         # 'provider' field is just the configured label for whatever answered at
         # this URL; record the *observed* engine, and shout if it isn't the one
@@ -1757,21 +1935,31 @@ def run_benchmarks(records, active, cache):
         # mlx port) so a mislabeled number can't poison cross-runtime comparisons.
         if expected and observed and observed not in ("unknown", expected):
             print(f"warning: {rec.name}: expected {expected} at {host} but "
-                  f"observed {observed} (fingerprint={result.system_fingerprint}); "
+                  f"observed {observed} (fingerprint={rep.system_fingerprint}); "
                   "recording the observed backend", file=sys.stderr)
-        cache[cache_key(rec)] = {
+        entry = {
             "provider": rec.provider,
             "model": rec.name,
-            "tokens_per_second": result.tokens_per_second,
-            "time_to_first_token": result.time_to_first_token,
+            "tokens_per_second": agg["tokens_per_second"],
+            "tps_min": agg["tps_min"],
+            "tps_max": agg["tps_max"],
+            "samples": agg["samples"],
+            "time_to_first_token": agg["time_to_first_token"],
+            "draft_n": agg["draft_n"],
+            "draft_n_accepted": agg["draft_n_accepted"],
             "endpoint": host,
-            "tps_source": result.tps_source,
+            "tps_source": rep.tps_source,
             "observed_backend": observed,
-            "system_fingerprint": result.system_fingerprint,
+            "system_fingerprint": rep.system_fingerprint,
             "benchmarked_at": int(time.time()),
-            "prompt": DEFAULT_PROMPT,
+            "prompt": BENCH_PROMPTS[primary],
+            "prompt_nonced": True,
             "max_tokens": DEFAULT_MAX_TOKENS,
         }
+        if len(kinds) > 1:
+            entry["by_kind"] = {kind: dict(kagg)
+                                for kind, (kagg, _) in measured.items()}
+        cache[cache_key(rec)] = entry
         changed = True
     return changed
 
@@ -1796,7 +1984,23 @@ def parse_args(argv=None):
              "benchmarks models without a cached value, 'all' benchmarks "
              "every model, anything else names the model(s) to benchmark",
     )
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=DEFAULT_SAMPLES,
+        metavar="N",
+        help=f"independent (nonced) runs to take the median over "
+             f"(default {DEFAULT_SAMPLES})",
+    )
+    parser.add_argument(
+        "--bench-suite",
+        action="store_true",
+        help="benchmark a {prose, code} prompt pair instead of prose only; "
+             "adds nested by_kind results and CODE/S + CODE%% columns",
+    )
     args = parser.parse_args(argv)
+    if args.samples < 1:
+        parser.error("--samples must be at least 1")
     targets = args.bench or []
     if len(targets) > 1 and not {"all", "missing"}.isdisjoint(targets):
         parser.error("--bench: 'all'/'missing' cannot be combined with other targets")
@@ -1820,7 +2024,9 @@ def main():
         selected, unknown = select_bench_records(records, args.bench, cache)
         if unknown:
             print(f"warning: model not found: {', '.join(unknown)}", file=sys.stderr)
-        if run_benchmarks(selected, active, cache):
+        kinds = ["prose", "code"] if args.bench_suite else ["prose"]
+        if run_benchmarks(selected, active, cache, samples=args.samples,
+                          kinds=kinds):
             save_cache(cache)
         # With --bench, print only the targeted models, not the whole listing.
         display = selected

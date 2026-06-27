@@ -178,6 +178,18 @@ class LMStudioBenchTests(unittest.TestCase):
     def test_zero_tps_returns_none(self):
         self.assertIsNone(toks.parse_lmstudio_bench({"stats": {"tokens_per_second": 0}}))
 
+    def test_degenerate_one_token_generation_rejected(self):
+        # 1 token then EOS: lmstudio reports tps over ~0s -> a nonsense number
+        # (e.g. 142857 tok/s). A non-representative run must not be cached.
+        self.assertIsNone(toks.parse_lmstudio_bench(
+            {"stats": {"tokens_per_second": 142857.0, "generation_time": 0},
+             "usage": {"completion_tokens": 1}}))
+
+    def test_full_generation_with_usage_kept(self):
+        result = toks.parse_lmstudio_bench(
+            {"stats": {"tokens_per_second": 51.0}, "usage": {"completion_tokens": 200}})
+        self.assertAlmostEqual(result.tokens_per_second, 51.0)
+
 
 class OllamaBenchTests(unittest.TestCase):
     def test_computes_tps_from_eval_counts(self):
@@ -198,6 +210,11 @@ class OllamaBenchTests(unittest.TestCase):
     def test_missing_metrics_returns_none(self):
         self.assertIsNone(toks.parse_ollama_bench({}))
         self.assertIsNone(toks.parse_ollama_bench({"eval_count": 0, "eval_duration": 0}))
+
+    def test_degenerate_one_token_generation_rejected(self):
+        # 1 token in ~1us is a degenerate run, not a throughput measurement.
+        self.assertIsNone(toks.parse_ollama_bench(
+            {"eval_count": 1, "eval_duration": 1000}))
 
 
 # ---- Ollama listing --------------------------------------------------------
@@ -691,6 +708,14 @@ class ParseArgsTests(unittest.TestCase):
     def test_provider_flag_survives(self):
         self.assertEqual(toks.parse_args(["--provider", "ollama"]).provider, "ollama")
 
+    def test_samples_flag_default_and_override(self):
+        self.assertEqual(toks.parse_args([]).samples, toks.DEFAULT_SAMPLES)
+        self.assertEqual(toks.parse_args(["--samples", "5"]).samples, 5)
+
+    def test_samples_rejects_non_positive(self):
+        self._error(["--samples", "0"])
+        self._error(["--samples", "-3"])
+
 
 class SelectBenchRecordsTests(unittest.TestCase):
     def setUp(self):
@@ -725,28 +750,136 @@ class SelectBenchRecordsTests(unittest.TestCase):
         self.assertEqual(unknown, ["nope"])
 
 
+class NoncePromptTests(unittest.TestCase):
+    def test_two_calls_differ(self):
+        self.assertNotEqual(toks.nonce_prompt("hi"), toks.nonce_prompt("hi"))
+
+    def test_base_prompt_preserved_as_suffix(self):
+        self.assertTrue(toks.nonce_prompt("the base").endswith("the base"))
+
+    def test_unique_bytes_lead(self):
+        a, b = toks.nonce_prompt("BASE"), toks.nonce_prompt("BASE")
+        lead_a, lead_b = a[: -len("BASE")], b[: -len("BASE")]
+        self.assertNotEqual(lead_a, lead_b)        # the differing part leads
+        self.assertTrue(lead_a.startswith("["))    # nonce is a bracketed prefix
+
+
+class AggregateSamplesTests(unittest.TestCase):
+    def test_median_min_max_odd(self):
+        agg = toks.aggregate_samples(
+            [toks.BenchResult(x, 0.1) for x in (40.0, 60.0, 50.0)])
+        self.assertAlmostEqual(agg["tokens_per_second"], 50.0)
+        self.assertAlmostEqual(agg["tps_min"], 40.0)
+        self.assertAlmostEqual(agg["tps_max"], 60.0)
+        self.assertEqual(agg["samples"], 3)
+
+    def test_median_even(self):
+        agg = toks.aggregate_samples([toks.BenchResult(x) for x in (40.0, 50.0)])
+        self.assertAlmostEqual(agg["tokens_per_second"], 45.0)
+
+    def test_single_sample(self):
+        agg = toks.aggregate_samples([toks.BenchResult(42.0, 0.1)])
+        self.assertAlmostEqual(agg["tokens_per_second"], 42.0)
+        self.assertAlmostEqual(agg["tps_min"], 42.0)
+        self.assertAlmostEqual(agg["tps_max"], 42.0)
+        self.assertEqual(agg["samples"], 1)
+
+    def test_ttft_median_ignores_missing(self):
+        results = [toks.BenchResult(40.0, 0.1), toks.BenchResult(50.0, None),
+                   toks.BenchResult(60.0, 0.3)]
+        self.assertAlmostEqual(
+            toks.aggregate_samples(results)["time_to_first_token"], 0.2)
+
+    def test_ttft_none_when_all_missing(self):
+        agg = toks.aggregate_samples([toks.BenchResult(40.0), toks.BenchResult(50.0)])
+        self.assertIsNone(agg["time_to_first_token"])
+
+    def test_ttft_zero_is_a_reported_value_not_missing(self):
+        # A reported 0.0 is data, not absence (absence is None) -- keep it.
+        results = [toks.BenchResult(40.0, 0.0), toks.BenchResult(60.0, 0.2)]
+        self.assertAlmostEqual(
+            toks.aggregate_samples(results)["time_to_first_token"], 0.1)
+
+    def test_pooled_acceptance(self):
+        results = [toks.BenchResult(40.0, draft_n=48, draft_n_accepted=46),
+                   toks.BenchResult(50.0, draft_n=52, draft_n_accepted=40)]
+        agg = toks.aggregate_samples(results)
+        self.assertEqual(agg["draft_n"], 100)            # pooled drafted
+        self.assertEqual(agg["draft_n_accepted"], 86)    # pooled accepted
+
+    def test_pooled_acceptance_mixed_with_and_without_draft(self):
+        # One spec-decode sample, one plain sample: pooled counters ignore the
+        # plain one (None treated as 0) rather than corrupting the ratio.
+        results = [toks.BenchResult(40.0, draft_n=48, draft_n_accepted=46),
+                   toks.BenchResult(50.0)]
+        agg = toks.aggregate_samples(results)
+        self.assertEqual(agg["draft_n"], 48)
+        self.assertEqual(agg["draft_n_accepted"], 46)
+
+    def test_draft_none_when_no_sample_carries_it(self):
+        agg = toks.aggregate_samples([toks.BenchResult(40.0), toks.BenchResult(50.0)])
+        self.assertIsNone(agg["draft_n"])
+        self.assertIsNone(agg["draft_n_accepted"])
+
+
+class BenchDefaultsTests(unittest.TestCase):
+    def test_default_max_tokens_is_256(self):
+        self.assertEqual(toks.DEFAULT_MAX_TOKENS, 256)
+
+    def test_default_samples_is_3(self):
+        self.assertEqual(toks.DEFAULT_SAMPLES, 3)
+
+
 class RunBenchmarksTests(unittest.TestCase):
     class FakeProvider:
-        def __init__(self):
+        def __init__(self, results=None):
             self.calls = []
+            self._results = list(results) if results is not None else None
 
         def benchmark(self, rec, prompt, max_tokens):
             self.calls.append((rec.name, prompt, max_tokens))
+            if self._results is not None:
+                return self._results.pop(0)
             return toks.BenchResult(42.0, 0.1)
 
-    def test_benchmarks_with_default_prompt_and_tokens(self):
+    def test_runs_n_samples_with_distinct_nonced_prompts(self):
         rec = toks.ModelRecord("ollama", "scribe:8b", digest="aaaa1111",
                                benchmarkable=True)
-        provider = self.FakeProvider()
+        provider = self.FakeProvider([toks.BenchResult(40.0, 0.1),
+                                      toks.BenchResult(50.0, 0.2),
+                                      toks.BenchResult(60.0, 0.3)])
         cache = {}
         with contextlib.redirect_stderr(io.StringIO()):
             changed = toks.run_benchmarks([rec], {"ollama": provider}, cache)
         self.assertTrue(changed)
-        self.assertEqual(provider.calls,
-                         [("scribe:8b", toks.DEFAULT_PROMPT, toks.DEFAULT_MAX_TOKENS)])
+        self.assertEqual(len(provider.calls), 3)               # DEFAULT_SAMPLES
+        prompts = [p for (_, p, _) in provider.calls]
+        self.assertEqual(len(set(prompts)), 3)                 # each nonce distinct
+        self.assertTrue(all(p.endswith(toks.DEFAULT_PROMPT) for p in prompts))
+        self.assertEqual({mt for (_, _, mt) in provider.calls},
+                         {toks.DEFAULT_MAX_TOKENS})
+        entry = cache["ollama:aaaa1111"]
+        self.assertAlmostEqual(entry["tokens_per_second"], 50.0)   # median
+        self.assertEqual(entry["samples"], 3)
+        self.assertAlmostEqual(entry["tps_min"], 40.0)
+        self.assertAlmostEqual(entry["tps_max"], 60.0)
+        self.assertEqual(entry["prompt"], toks.DEFAULT_PROMPT)     # nonce stripped
+        self.assertTrue(entry["prompt_nonced"])
+        self.assertEqual(entry["max_tokens"], toks.DEFAULT_MAX_TOKENS)
+
+    def test_samples_one_reproduces_single_shot(self):
+        rec = toks.ModelRecord("ollama", "scribe:8b", digest="aaaa1111",
+                               benchmarkable=True)
+        provider = self.FakeProvider([toks.BenchResult(42.0, 0.1)])
+        cache = {}
+        with contextlib.redirect_stderr(io.StringIO()):
+            toks.run_benchmarks([rec], {"ollama": provider}, cache, samples=1)
+        self.assertEqual(len(provider.calls), 1)
         entry = cache["ollama:aaaa1111"]
         self.assertAlmostEqual(entry["tokens_per_second"], 42.0)
-        self.assertEqual(entry["max_tokens"], toks.DEFAULT_MAX_TOKENS)
+        self.assertEqual(entry["samples"], 1)
+        self.assertAlmostEqual(entry["tps_min"], 42.0)
+        self.assertAlmostEqual(entry["tps_max"], 42.0)
 
     def test_non_benchmarkable_is_skipped(self):
         rec = toks.ModelRecord("lmstudio", "tiny-embedder", benchmarkable=False)
@@ -1333,6 +1466,23 @@ class LlamaCppTimingsTests(unittest.TestCase):
         self.assertEqual(result.tokens_per_second, 10)
         self.assertIsNone(result.time_to_first_token)
 
+    def test_lifts_draft_and_cache_counters(self):
+        # The real Studio /v1/completions timings block (verified 2026-06-27).
+        result = toks.parse_llamacpp_timings({"timings": {
+            "cache_n": 1, "prompt_n": 4, "prompt_ms": 19.8, "predicted_n": 64,
+            "predicted_ms": 366.7, "predicted_per_second": 174.5,
+            "draft_n": 48, "draft_n_accepted": 46}})
+        self.assertEqual(result.draft_n, 48)
+        self.assertEqual(result.draft_n_accepted, 46)
+        self.assertEqual(result.cache_n, 1)
+
+    def test_draft_and_cache_none_when_absent(self):
+        result = toks.parse_llamacpp_timings(
+            {"timings": {"predicted_per_second": 10}})
+        self.assertIsNone(result.draft_n)
+        self.assertIsNone(result.draft_n_accepted)
+        self.assertIsNone(result.cache_n)
+
 
 class BenchLlamacppSseTests(unittest.TestCase):
     CHUNKS = [
@@ -1679,6 +1829,193 @@ class LoadDotenvTests(unittest.TestCase):
         with mock.patch.dict(toks.os.environ, {}, clear=True):
             toks.load_dotenv("/nonexistent/dir/.env")   # must not raise
             self.assertNotIn("UNSLOTH_API_KEY", toks.os.environ)
+
+
+# ---- Part B: speculative-decoding acceptance -------------------------------
+
+
+class DraftStatsFromSseTests(unittest.TestCase):
+    CHUNKS = [{"choices": [{"text": "a"}]}, {"choices": [{"text": "b"}]}]
+
+    def test_bench_from_sse_lifts_draft_when_timings_present(self):
+        # A llama.cpp impostor squatting on the mlx port carries a timings block.
+        final = {"choices": [], "usage": {"completion_tokens": 6},
+                 "timings": {"predicted_per_second": 99.0, "draft_n": 10,
+                             "draft_n_accepted": 9, "cache_n": 0}}
+        lines = _sse(*self.CHUNKS, final)
+        r = toks.bench_from_sse(lines, start=0.0, clock=FakeClock([1.0, 2.0]))
+        self.assertEqual((r.draft_n, r.draft_n_accepted, r.cache_n), (10, 9, 0))
+
+    def test_bench_from_sse_pure_client_stream_has_no_draft(self):
+        lines = _sse(*self.CHUNKS,
+                     {"choices": [], "usage": {"completion_tokens": 6}})
+        r = toks.bench_from_sse(lines, start=0.0, clock=FakeClock([1.0, 2.0]))
+        self.assertIsNone(r.draft_n)
+        self.assertIsNone(r.draft_n_accepted)
+        self.assertIsNone(r.cache_n)
+
+    def test_bench_llamacpp_sse_surfaces_draft_from_server_timings(self):
+        final = {"choices": [], "usage": {"completion_tokens": 50},
+                 "timings": {"predicted_per_second": 42.0, "prompt_ms": 200.0,
+                             "draft_n": 48, "draft_n_accepted": 46, "cache_n": 2}}
+        lines = _sse(*self.CHUNKS, final)
+        r = toks.bench_llamacpp_sse(lines, start=0.0, clock=FakeClock([1.0, 2.0]))
+        self.assertEqual((r.draft_n, r.draft_n_accepted, r.cache_n), (48, 46, 2))
+
+
+class CachedAcceptanceTests(unittest.TestCase):
+    def test_ratio_from_stored_pair(self):
+        cache = {"unsloth:m": {"draft_n": 48, "draft_n_accepted": 46}}
+        self.assertAlmostEqual(
+            toks.cached_acceptance(cache, toks.ModelRecord("unsloth", "m")), 46 / 48)
+
+    def test_none_when_draft_zero(self):
+        cache = {"unsloth:m": {"draft_n": 0, "draft_n_accepted": 0}}
+        self.assertIsNone(
+            toks.cached_acceptance(cache, toks.ModelRecord("unsloth", "m")))
+
+    def test_none_when_missing(self):
+        cache = {"ollama:m": {"tokens_per_second": 100.0}}
+        self.assertIsNone(
+            toks.cached_acceptance(cache, toks.ModelRecord("ollama", "m")))
+
+
+class AccColumnTests(unittest.TestCase):
+    def test_header_and_alignment_include_acc(self):
+        self.assertEqual(toks.HEADER.index("ACC%"),
+                         toks.HEADER.index("TOKENS/S") + 1)
+        self.assertIn("ACC%", toks.RIGHT_ALIGN)
+
+    def test_row_renders_acceptance_percent(self):
+        cache = {"unsloth:m": {"tokens_per_second": 172.0,
+                               "draft_n": 48, "draft_n_accepted": 46}}
+        rows = toks.build_rows([toks.ModelRecord("unsloth", "m")], cache)
+        self.assertEqual(dict(zip(rows[0], rows[1]))["ACC%"], "96%")
+
+    def test_row_dash_when_no_acceptance(self):
+        cache = {"ollama:m": {"tokens_per_second": 100.0}}
+        rows = toks.build_rows([toks.ModelRecord("ollama", "m")], cache)
+        self.assertEqual(dict(zip(rows[0], rows[1]))["ACC%"], "-")
+
+
+class CacheNGuardTests(unittest.TestCase):
+    class GuardProvider:
+        def __init__(self, cache_n):
+            self.host = "http://127.0.0.1:8888"
+            self.expected_backend = None
+            self._cache_n = cache_n
+
+        def benchmark(self, rec, prompt, max_tokens):
+            return toks.BenchResult(150.0, 0.1, tps_source="llamacpp_timings",
+                                    observed_backend="llamacpp", draft_n=48,
+                                    draft_n_accepted=46, cache_n=self._cache_n)
+
+    def _run(self, cache_n):
+        rec = toks.ModelRecord("unsloth", "m", benchmarkable=True)
+        cache = {}
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            toks.run_benchmarks([rec], {"unsloth": self.GuardProvider(cache_n)},
+                                cache, samples=1)
+        return cache[toks.cache_key(rec)], err.getvalue()
+
+    def test_warns_when_cache_n_exceeds_budget(self):
+        entry, err = self._run(64)
+        self.assertIn("cache_n", err)
+        self.assertIn("64", err)
+        self.assertAlmostEqual(entry["tokens_per_second"], 150.0)   # recorded anyway
+
+    def test_no_warning_at_cache_n_zero(self):
+        _, err = self._run(0)
+        self.assertNotIn("cache_n", err)
+
+
+# ---- Part C: content spread across prompt kinds (--bench-suite) -------------
+
+
+class BenchSuiteTests(unittest.TestCase):
+    class SuiteProvider:
+        host = "http://127.0.0.1:8888"
+        expected_backend = None
+
+        def __init__(self):
+            self.prompts = []
+
+        def benchmark(self, rec, prompt, max_tokens):
+            self.prompts.append(prompt)
+            if prompt.endswith(toks.BENCH_PROMPTS["code"]):
+                return toks.BenchResult(300.0, 0.1, observed_backend="llamacpp",
+                                        draft_n=50, draft_n_accepted=48)
+            return toks.BenchResult(100.0, 0.2, observed_backend="llamacpp",
+                                    draft_n=10, draft_n_accepted=3)
+
+    def test_bench_prompts_has_prose_and_code(self):
+        self.assertEqual(toks.BENCH_PROMPTS["prose"], toks.DEFAULT_PROMPT)
+        self.assertIn("code", toks.BENCH_PROMPTS)
+
+    def test_bench_suite_flag_default_false(self):
+        self.assertFalse(toks.parse_args([]).bench_suite)
+        self.assertTrue(toks.parse_args(["--bench-suite"]).bench_suite)
+
+    def test_suite_writes_by_kind_with_prose_top_level(self):
+        rec = toks.ModelRecord("unsloth", "m", benchmarkable=True)
+        provider = self.SuiteProvider()
+        cache = {}
+        with contextlib.redirect_stderr(io.StringIO()):
+            toks.run_benchmarks([rec], {"unsloth": provider}, cache, samples=1,
+                                kinds=["prose", "code"])
+        entry = cache["unsloth:m"]
+        self.assertAlmostEqual(entry["tokens_per_second"], 100.0)     # prose
+        self.assertEqual(entry["draft_n"], 10)                        # prose pooled
+        self.assertIn("by_kind", entry)
+        self.assertAlmostEqual(entry["by_kind"]["prose"]["tokens_per_second"], 100.0)
+        self.assertAlmostEqual(entry["by_kind"]["code"]["tokens_per_second"], 300.0)
+        self.assertEqual(entry["by_kind"]["code"]["draft_n"], 50)
+        self.assertEqual(entry["by_kind"]["code"]["draft_n_accepted"], 48)
+
+    def test_default_run_writes_no_by_kind(self):
+        rec = toks.ModelRecord("ollama", "m", digest="d", benchmarkable=True)
+        provider = self.SuiteProvider()
+        cache = {}
+        with contextlib.redirect_stderr(io.StringIO()):
+            toks.run_benchmarks([rec], {"ollama": provider}, cache, samples=1)
+        self.assertNotIn("by_kind", cache["ollama:d"])
+        self.assertEqual(len(provider.prompts), 1)                    # prose only
+
+
+class CodeColumnTests(unittest.TestCase):
+    def _suite_cache(self):
+        return {"unsloth:m": {"tokens_per_second": 100.0, "draft_n": 10,
+                              "draft_n_accepted": 3,
+                              "by_kind": {"code": {"tokens_per_second": 300.0,
+                                                   "draft_n": 50,
+                                                   "draft_n_accepted": 48}}}}
+
+    def test_code_columns_present_when_by_kind_code(self):
+        rows = toks.build_rows([toks.ModelRecord("unsloth", "m")], self._suite_cache())
+        header = rows[0]
+        self.assertEqual(header.index("CODE/S"), header.index("ACC%") + 1)
+        self.assertEqual(header.index("CODE%"), header.index("CODE/S") + 1)
+        cell = dict(zip(header, rows[1]))
+        self.assertEqual(cell["CODE/S"], "300.0")
+        self.assertEqual(cell["CODE%"], "96%")
+
+    def test_code_columns_absent_without_by_kind(self):
+        cache = {"ollama:m": {"tokens_per_second": 100.0}}
+        rows = toks.build_rows([toks.ModelRecord("ollama", "m")], cache)
+        self.assertNotIn("CODE/S", rows[0])
+        self.assertNotIn("CODE%", rows[0])
+
+    def test_legacy_entry_renders_without_samples_draft_or_by_kind(self):
+        cache = {"ollama:d": {"tokens_per_second": 80.0, "provider": "ollama"}}
+        rec = toks.ModelRecord("ollama", "old", digest="d")
+        self.assertAlmostEqual(toks.cached_tps(cache, rec), 80.0)
+        self.assertIsNone(toks.cached_acceptance(cache, rec))
+        rows = toks.build_rows([rec], cache)
+        self.assertNotIn("CODE/S", rows[0])                          # no by_kind
+        cell = dict(zip(rows[0], rows[1]))
+        self.assertEqual(cell["TOKENS/S"], "80.0")
+        self.assertEqual(cell["ACC%"], "-")
 
 
 if __name__ == "__main__":
