@@ -9,15 +9,23 @@ dependencies, no `pip install`.
 ```
 $ toks
 ollama ✓  lmstudio ✓  mlx ✗  unsloth ✓
-PROVIDER │ NAME                        │    SIZE │ TAG  │ PARAMS │  BPW │  CTX │ TTFT │ TOKENS/S │ MODIFIED
-─────────┼─────────────────────────────┼─────────┼──────┼────────┼──────┼──────┼──────┼──────────┼────────────
-unsloth  │ unsloth/gemma-4-31B-it-GGUF │ 17.1 GB │ gguf │    31B │ 4.78 │ 256k │ 0.10 │     39.6 │ 2 hours ago
-ollama   │ gemma4:31b-mlx              │ 18.8 GB │ mlx  │    31B │ 5.18 │ 256k │ 0.37 │     25.0 │ 3 weeks ago
+PROVIDER │ NAME                          │    SIZE │ TAG  │ PARAMS │  BPW │  CTX │ TTFT │ TOKENS/S │ MODIFIED
+─────────┼───────────────────────────────┼─────────┼──────┼────────┼──────┼──────┼──────┼──────────┼────────────
+unsloth  │ ✓ unsloth/gemma-4-31B-it-GGUF │ 17.1 GB │ gguf │    31B │ 4.78 │ 256k │ 0.10 │     39.6 │ 2 hours ago
+ollama   │   gemma4:31b-mlx              │ 18.8 GB │ mlx  │    31B │ 5.18 │ 256k │ 0.37 │     25.0 │ 3 weeks ago
 ```
 
 The first line is a one-line reachability summary printed to stderr — a green ✓
 for each backend that answered the listing request and a red ✗ for one that
 didn't (here mlx-lm is down).
+
+A green **✓** in front of a model name marks it as **currently loaded** (resident
+in memory / serving) rather than merely downloaded — above, the `gemma-4-31B` is
+loaded and the `gemma4:31b-mlx` is not. Loaded state comes from each backend that
+reports it: LM Studio's listing, Ollama's `/api/ps`, the model `llama-server`
+serves, and the one Unsloth Studio reports loaded. `mlx_lm.server` exposes no
+loaded-state signal, so mlx rows are never marked. The tick is coloured only when
+stdout is a TTY (and `NO_COLOR` is unset); piped output keeps a plain `✓ ` prefix.
 
 The **`BPW`** column is on-disk bits ÷ parameter count — the *effective* width,
 which can differ sharply from the quant's nominal one. Above, two 31B Gemma-4
@@ -188,7 +196,7 @@ Studio and mlx-lm off, it behaves exactly like the original Ollama-only tool.
 ## Tests
 
 ```
-python3 -m unittest test_toks   # 179 network-free unit tests
+python3 -m unittest test_toks   # 235 network-free unit tests
 ```
 
 ## Design

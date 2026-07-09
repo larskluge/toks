@@ -83,6 +83,18 @@ class LMStudioListingTests(unittest.TestCase):
         moe = toks.lmstudio_parse_models(LMSTUDIO_V0)[2]
         self.assertEqual(moe.ctx_loaded, 8192)
 
+    def test_loaded_flag_from_state(self):
+        recs = toks.lmstudio_parse_models(LMSTUDIO_V0)
+        self.assertFalse(recs[0].loaded)          # state: not-loaded
+        self.assertFalse(recs[1].loaded)          # state: not-loaded
+        self.assertTrue(recs[2].loaded)           # state: loaded
+
+    def test_loaded_flag_falls_back_to_loaded_context_length(self):
+        payload = {"data": [{"id": "m", "type": "llm", "loaded_context_length": 4096}]}
+        self.assertTrue(toks.lmstudio_parse_models(payload)[0].loaded)
+        bare = {"data": [{"id": "m", "type": "llm"}]}
+        self.assertFalse(toks.lmstudio_parse_models(bare)[0].loaded)
+
     def test_llm_and_vlm_are_benchmarkable_embeddings_are_not(self):
         recs = {r.name: r for r in toks.lmstudio_parse_models(LMSTUDIO_V0)}
         self.assertTrue(recs["vision-scribe-7b"].benchmarkable)   # vlm
@@ -277,6 +289,52 @@ class OllamaListingTests(unittest.TestCase):
         recs = {r.name: r for r in toks.ollama_parse_models(OLLAMA_TAGS, OLLAMA_INFO)}
         self.assertEqual(recs["scribe:8b"].params, "8B")
         self.assertIn("MoE", recs["vision-mlx:26b-mlx"].params)
+
+
+class OllamaRunningDigestsTests(unittest.TestCase):
+    PS = {"models": [{"name": "scribe:8b", "digest": "aaaa1111"},
+                     {"name": "vision-mlx:26b-mlx", "digest": "bbbb2222"}]}
+
+    def test_extracts_digests_and_names(self):
+        digests, names = toks.ollama_running_digests(self.PS)
+        self.assertEqual(digests, {"aaaa1111", "bbbb2222"})
+        self.assertEqual(names, {"scribe:8b", "vision-mlx:26b-mlx"})
+
+    def test_empty_or_malformed_yields_empty_sets(self):
+        self.assertEqual(toks.ollama_running_digests({}), (set(), set()))
+        self.assertEqual(toks.ollama_running_digests({"models": "nope"}), (set(), set()))
+        self.assertEqual(toks.ollama_running_digests(None), (set(), set()))
+
+    def test_provider_marks_only_running_models(self):
+        provider = toks.OllamaProvider()
+
+        def fake_json(url, *a, **k):
+            if url.endswith("/api/tags"):
+                return {"models": OLLAMA_TAGS}
+            if url.endswith("/api/ps"):
+                return {"models": [{"name": "scribe:8b", "digest": "aaaa1111"}]}
+            raise AssertionError(f"unexpected url {url}")
+
+        with mock.patch.object(toks, "http_json", side_effect=fake_json), \
+                mock.patch.object(toks, "fetch_all_model_info", return_value=OLLAMA_INFO):
+            recs = {r.name: r for r in provider.list_models()}
+        self.assertTrue(recs["scribe:8b"].loaded)             # in /api/ps
+        self.assertFalse(recs["vision-mlx:26b-mlx"].loaded)   # not resident
+
+    def test_provider_survives_missing_ps_endpoint(self):
+        provider = toks.OllamaProvider()
+
+        def fake_json(url, *a, **k):
+            if url.endswith("/api/tags"):
+                return {"models": OLLAMA_TAGS}
+            if url.endswith("/api/ps"):
+                raise RuntimeError("404")
+            raise AssertionError(f"unexpected url {url}")
+
+        with mock.patch.object(toks, "http_json", side_effect=fake_json), \
+                mock.patch.object(toks, "fetch_all_model_info", return_value=OLLAMA_INFO):
+            recs = provider.list_models()
+        self.assertTrue(recs and not any(r.loaded for r in recs))
 
 
 # ---- mlx listing -----------------------------------------------------------
@@ -644,7 +702,7 @@ class BuildRowsTests(unittest.TestCase):
         row = rows[1]  # router-moe-15b
         cell = dict(zip(header, row))
         self.assertEqual(cell["PROVIDER"], "lmstudio")
-        self.assertEqual(cell["NAME"], "router-moe-15b")
+        self.assertEqual(cell["NAME"], "  router-moe-15b")  # 2-col marker, unloaded
         self.assertEqual(cell["TAG"], "gguf moe")
         self.assertEqual(cell["SIZE"], "-")            # unknown for LM Studio v0
         self.assertEqual(cell["TOKENS/S"], "188.0")
@@ -668,6 +726,39 @@ class BuildRowsTests(unittest.TestCase):
         self.assertIn(" │ ", lines[0])               # column separators
         self.assertEqual(set(lines[1]), {"─", "┼"})   # header/body rule
         self.assertEqual(len(lines), 4)               # header + rule + 2 rows
+
+    def test_name_cell_marks_loaded_vs_unloaded(self):
+        self.records[0].loaded = True                # router-moe-15b resident
+        rows = toks.build_rows(self.records, self.cache, color=False)
+        self.assertEqual(rows[1][1], "✓ router-moe-15b")   # build_rows keeps order
+        self.assertEqual(rows[2][1], "  scribe:8b")        # 2 spaces, aligned
+
+    def test_name_cell_colorizes_tick_only_when_enabled(self):
+        self.records[0].loaded = True
+        plain = toks.build_rows(self.records, self.cache, color=False)[1][1]
+        self.assertNotIn("\x1b", plain)
+        colored = toks.build_rows(self.records, self.cache, color=True)[1][1]
+        self.assertIn(f"\x1b[{toks.STATUS_OK}m✓", colored)
+        self.assertTrue(colored.endswith("router-moe-15b"))
+
+    def test_table_alignment_unaffected_by_color(self):
+        self.records[0].loaded = True
+        plain = toks.table(toks.build_rows(self.records, self.cache, color=False))
+        colored = toks.table(toks.build_rows(self.records, self.cache, color=True))
+        # Stripping the escapes from the coloured render must reproduce the plain
+        # one exactly -- proves widths/positions ignore the invisible ANSI.
+        self.assertEqual(toks._ANSI_RE.sub("", colored), plain)
+
+
+class VisibleWidthTests(unittest.TestCase):
+    def test_ignores_ansi_escapes(self):
+        self.assertEqual(toks._visible_width("abc"), 3)
+        self.assertEqual(toks._visible_width(f"\x1b[{toks.STATUS_OK}m✓\x1b[0m"), 1)
+
+    def test_pad_accounts_for_invisible_escapes(self):
+        colored = f"\x1b[{toks.STATUS_OK}m✓\x1b[0m"
+        self.assertEqual(toks._visible_width(toks._pad(colored, 5, right=False)), 5)
+        self.assertEqual(toks._visible_width(toks._pad("x", 5, right=True)), 5)
 
 
 # ---- CLI parsing + benchmark target selection ------------------------------
@@ -1321,7 +1412,58 @@ class UnslothListModelsTests(unittest.TestCase):
                 mock.patch.object(toks, "is_local_host", return_value=False):
             recs = provider.list_models()
         self.assertEqual([r.name for r in recs], ["acme/demo-31B-it-GGUF"])
-        self.assertTrue(hj.call_args[0][0].endswith("/api/hub/local"))
+        urls = [c[0][0] for c in hj.call_args_list]
+        self.assertTrue(urls[0].endswith("/api/hub/local"))       # listing first
+        self.assertTrue(any(u.endswith("/v1/models") for u in urls))  # loaded probe
+
+    def test_marks_the_served_model_loaded(self):
+        provider = toks.UnslothProvider()
+
+        def fake_json(url, *a, **k):
+            if url.endswith("/api/hub/local"):
+                return ENRICH_LOCAL
+            if url.endswith("/v1/models"):
+                return {"data": [{"id": "acme/demo-31B-it-GGUF"}]}
+            raise AssertionError(f"unexpected url {url}")
+
+        with mock.patch.object(toks, "http_json", side_effect=fake_json), \
+                mock.patch.object(toks, "is_local_host", return_value=False):
+            recs = provider.list_models()
+        self.assertEqual([r.name for r in recs], ["acme/demo-31B-it-GGUF"])
+        self.assertTrue(recs[0].loaded)
+
+    def test_survives_nothing_loaded(self):
+        provider = toks.UnslothProvider()
+
+        def fake_json(url, *a, **k):
+            if url.endswith("/api/hub/local"):
+                return ENRICH_LOCAL
+            if url.endswith("/v1/models"):
+                raise RuntimeError("no model loaded")
+            raise AssertionError(f"unexpected url {url}")
+
+        with mock.patch.object(toks, "http_json", side_effect=fake_json), \
+                mock.patch.object(toks, "is_local_host", return_value=False):
+            recs = provider.list_models()
+        self.assertFalse(any(r.loaded for r in recs))
+
+
+class UnslothServedIdsTests(unittest.TestCase):
+    def test_canonicalises_id_and_stores_bare_alias(self):
+        ids = toks.unsloth_served_ids({"data": [{"id": "Acme/Demo-31B-it-GGUF"}]})
+        self.assertIn("acme/demo-31b-it-GGUF".lower(), ids)   # full canonical
+        self.assertIn("demo-31b-it-gguf", ids)                # bare alias
+
+    def test_decodes_hf_cache_path(self):
+        served = ("/home/u/.cache/huggingface/hub/models--acme--demo-31B-it-GGUF/"
+                  "snapshots/abc123/demo-31B-it-UD-Q4_K_XL.gguf")
+        ids = toks.unsloth_served_ids({"data": [{"id": served}]})
+        self.assertIn("acme/demo-31b-it-gguf", ids)
+
+    def test_empty_or_malformed_yields_empty_set(self):
+        self.assertEqual(toks.unsloth_served_ids({}), set())
+        self.assertEqual(toks.unsloth_served_ids({"data": "nope"}), set())
+        self.assertEqual(toks.unsloth_served_ids(None), set())
 
 
 class ServedModelMatchesTests(unittest.TestCase):
@@ -1669,6 +1811,7 @@ class LlamaListingTests(unittest.TestCase):
         self.assertEqual((rec.provider, rec.name, rec.fmt),
                          ("llama", "acme/demo-31B-it-GGUF", "gguf"))
         self.assertTrue(rec.benchmarkable)
+        self.assertTrue(rec.loaded)              # llama-server lists only the loaded one
 
     def test_meta_populates_params_size_and_ctx(self):
         rec = toks.llama_parse_models(LLAMA_MODELS)[0]

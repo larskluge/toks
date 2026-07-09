@@ -13,6 +13,7 @@ import argparse
 import concurrent.futures
 import json
 import os
+import re
 import secrets
 import statistics
 import struct
@@ -77,6 +78,7 @@ class ModelRecord:
     ctx_max: int | None = None
     ctx_loaded: int | None = None
     benchmarkable: bool = False
+    loaded: bool = False                 # True when resident/serving, not just on disk
     digest: str | None = None           # stable id for cache key (Ollama digest)
     param_count: int | None = None      # numeric total params (real or estimated)
     param_estimated: bool = False       # True when param_count derived from size
@@ -146,6 +148,8 @@ def lmstudio_parse_models(payload):
                 ctx_max=item.get("max_context_length"),
                 ctx_loaded=item.get("loaded_context_length"),
                 benchmarkable=model_type in ("llm", "vlm"),
+                loaded=(item.get("state") == "loaded")
+                or item.get("loaded_context_length") is not None,
                 raw=item,
             )
         )
@@ -469,6 +473,28 @@ def ollama_parse_models(tags_models, info_map):
             )
         )
     return records
+
+
+def ollama_running_digests(ps_payload):
+    """Extract (digests, names) of currently-loaded models from /api/ps.
+
+    Ollama's /api/ps lists the models resident in memory; each entry carries the
+    same `digest` and `name` that /api/tags does, so either identifies a loaded
+    model. Digest is the robust key (immune to tag renames); name is the fallback.
+    A missing or malformed payload yields empty sets -- callers then mark nothing.
+    """
+    models = (ps_payload or {}).get("models")
+    if not isinstance(models, list):
+        return set(), set()
+    digests, names = set(), set()
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        if item.get("digest"):
+            digests.add(item["digest"])
+        if item.get("name"):
+            names.add(item["name"])
+    return digests, names
 
 
 # --- mlx provider parsing (mlx_lm.server) ------------------------------------
@@ -935,8 +961,10 @@ def llama_parse_models(payload):
         model_id = item.get("id")
         if not model_id:
             continue
+        # llama-server runs one model per process and /v1/models names exactly it,
+        # so every listed record is the resident (loaded) model.
         rec = ModelRecord(provider="llama", name=model_id, fmt="gguf",
-                          benchmarkable=True, raw=item)
+                          benchmarkable=True, loaded=True, raw=item)
         meta = item.get("meta")
         if isinstance(meta, dict):
             n_params = meta.get("n_params")
@@ -1026,6 +1054,30 @@ def served_model_matches(requested, served):
     if req == srv:
         return True
     return req.rsplit("/", 1)[-1] == srv.rsplit("/", 1)[-1]
+
+
+def unsloth_served_ids(models_payload):
+    """Canonical ids (+ bare aliases) of the model Studio reports as loaded.
+
+    Studio's /v1/models echoes only the currently-loaded model; /api/hub/local
+    lists every downloaded one. Canonicalising both sides to `org/name` (decoding
+    HF-cache paths, see _canonical_model_id) lets a local record match the served
+    id on the full id or the bare alias -- the same rule served_model_matches uses.
+    Each id's bare alias is stored too, so an `org/name` <-> `name` split matches.
+    Empty/malformed payload (or nothing loaded) yields an empty set: mark nothing.
+    """
+    data = (models_payload or {}).get("data")
+    if not isinstance(data, list):
+        return set()
+    ids = set()
+    for item in data:
+        if not isinstance(item, dict):
+            continue
+        canon = _canonical_model_id(item.get("id"))
+        if canon:
+            ids.add(canon)
+            ids.add(canon.rsplit("/", 1)[-1])
+    return ids
 
 
 def _opt_int(value):
@@ -1270,7 +1322,17 @@ def _pct(value):
     return f"{value * 100:.0f}%" if value is not None else "-"
 
 
-def build_rows(records, cache):
+def _name_cell(rec, color):
+    """NAME cell with a 2-column loaded marker: green '✓ ' when resident, else '  '.
+
+    The marker width is always 2 visible columns (the ✓ or a plain space, plus a
+    separating space) so names stay aligned whether or not a row is loaded.
+    """
+    mark = _color("✓", STATUS_OK, color) if rec.loaded else " "
+    return f"{mark} {rec.name or '-'}"
+
+
+def build_rows(records, cache, color=False):
     # The code-spread columns only earn their width when a displayed model carries
     # a --bench-suite result; otherwise they are omitted entirely (no empty churn).
     show_code = any(_cached_by_kind(cache, rec, "code") for rec in records)
@@ -1286,7 +1348,7 @@ def build_rows(records, cache):
         ctx = rec.ctx_loaded or rec.ctx_max
         row = [
             rec.provider,
-            rec.name or "-",
+            _name_cell(rec, color),
             human_size(rec.size_bytes),
             tag_cell(rec),
             rec.params or "-",
@@ -1328,21 +1390,32 @@ def provider_status_line(statuses, color=True):
     return "  ".join(parts)
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _visible_width(cell):
+    """Displayed width of a cell, ignoring ANSI colour escapes."""
+    return len(_ANSI_RE.sub("", cell))
+
+
+def _pad(cell, width, right):
+    """Pad to `width` visible columns (str.ljust/rjust would miscount ANSI)."""
+    fill = " " * max(0, width - _visible_width(cell))
+    return fill + cell if right else cell + fill
+
+
 def table(rows):
     col_count = len(rows[0]) if rows else 0
     widths = [0] * col_count
     for row in rows:
         for index, cell in enumerate(row):
-            widths[index] = max(widths[index], len(cell))
+            widths[index] = max(widths[index], _visible_width(cell))
     header = rows[0] if rows else []
     lines = []
     for r_index, row in enumerate(rows):
         cells = []
         for index, cell in enumerate(row):
-            if header[index] in RIGHT_ALIGN:
-                cells.append(cell.rjust(widths[index]))
-            else:
-                cells.append(cell.ljust(widths[index]))
+            cells.append(_pad(cell, widths[index], header[index] in RIGHT_ALIGN))
         lines.append(" │ ".join(cells))
         if r_index == 0 and len(rows) > 1:
             lines.append("─┼─".join("─" * widths[index] for index in range(col_count)))
@@ -1524,7 +1597,17 @@ class OllamaProvider:
         if not isinstance(models, list):
             raise RuntimeError("Ollama returned an unexpected /api/tags response")
         info = fetch_all_model_info(self.host, models)
-        return ollama_parse_models(models, info)
+        records = ollama_parse_models(models, info)
+        # One extra localhost call marks which models are resident in memory.
+        # A missing/old /api/ps degrades to "no marks" rather than failing the list.
+        try:
+            ps = http_json(f"{self.host}/api/ps", timeout=LIST_TIMEOUT)
+            digests, names = ollama_running_digests(ps)
+        except RuntimeError:
+            digests, names = set(), set()
+        for rec in records:
+            rec.loaded = rec.digest in digests or rec.name in names
+        return records
 
     def benchmark(self, rec, prompt, max_tokens):
         payload = {
@@ -1634,6 +1717,17 @@ class UnslothProvider:
         data = http_json(f"{self.host}/api/hub/local", headers=self.headers,
                          timeout=LIST_TIMEOUT)
         records = unsloth_parse_local(data)
+        # /v1/models names only the currently-loaded model; mark it among the local
+        # set. Nothing loaded / old endpoint -> empty set -> no marks (never fails).
+        try:
+            served = unsloth_served_ids(
+                http_json(f"{self.host}/v1/models", headers=self.headers,
+                          timeout=LIST_TIMEOUT))
+        except RuntimeError:
+            served = set()
+        for rec in records:
+            canon = _canonical_model_id(rec.name)
+            rec.loaded = canon in served or canon.rsplit("/", 1)[-1] in served
         # Listing is ids-only; the weights' metadata lives in the HF cache,
         # readable only when Studio runs on this machine (the default localhost).
         if records and is_local_host(self.host):
@@ -2032,7 +2126,8 @@ def main():
         display = selected
 
     display.sort(key=lambda r: tps_sort_key(cache, r))
-    print(table(build_rows(display, cache)))
+    table_color = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    print(table(build_rows(display, cache, color=table_color)))
 
 
 if __name__ == "__main__":
